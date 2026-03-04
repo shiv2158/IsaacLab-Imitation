@@ -762,16 +762,16 @@ class ImitationG1LafanTrackEnvCfg(ImitationG1BaseTrackingEnvCfg):
     require_npz_body_states: bool = True
     autodetect_motion_fps: bool = True
     # -- optional explicit cfg overrides (no env-var controls)
-    lafan1_manifest_path: str | None = None
-    lafan1_manifest_data: Any | None = None
-    lafan1_dataset_path: str | None = None
-    lafan1_refresh_zarr_dataset: bool | None = None
-    lafan1_motions: list[str] | None = None
-    lafan1_trajectories: list[str] | None = None
-    lafan1_control_freq: float | None = None
-    lafan1_reset_schedule: str | None = None
-    lafan1_wrap_steps: bool | None = None
-    lafan1_reference_start_frame: int | None = None
+    lafan1_manifest_path: str = ""
+    lafan1_manifest_data: dict[str, Any] = {}
+    lafan1_dataset_path: str = ""
+    lafan1_refresh_zarr_dataset: bool = False
+    lafan1_motions: list[str] = []
+    lafan1_trajectories: list[str] = []
+    lafan1_control_freq: float = 0.0
+    lafan1_reset_schedule: str = ""
+    lafan1_wrap_steps: bool = False
+    lafan1_reference_start_frame: int = -1
 
     def _lafan_source_entries(self) -> list[dict[str, Any]]:
         try:
@@ -809,8 +809,8 @@ class ImitationG1LafanTrackEnvCfg(ImitationG1BaseTrackingEnvCfg):
     def _apply_loader_cfg_overrides(self) -> None:
         """Apply cfg-driven overrides for multi-motion/scheduler workflows."""
         manifest_entries = _load_lafan1_entries_from_manifest(
-            manifest_path=self.lafan1_manifest_path,
-            manifest_data=self.lafan1_manifest_data,
+            manifest_path=self.lafan1_manifest_path or None,
+            manifest_data=(self.lafan1_manifest_data if len(self.lafan1_manifest_data) > 0 else None),
         )
         if manifest_entries is not None:
             dataset_cfg = copy.deepcopy(self.loader_kwargs.get("dataset", {}))
@@ -822,27 +822,27 @@ class ImitationG1LafanTrackEnvCfg(ImitationG1BaseTrackingEnvCfg):
                 "dataset_name", "lafan1"
             )
             # If manifest is provided and no explicit cfg motion filter is set, include all manifest motions.
-            if self.lafan1_motions is None:
+            if len(self.lafan1_motions) == 0:
                 self.motions = [entry["name"] for entry in manifest_entries]
             # Avoid stale zarr caches by default for manifest-driven runs.
-            if self.lafan1_dataset_path is None:
+            if self.lafan1_dataset_path == "":
                 self.dataset_path = _dataset_path_from_entries(manifest_entries)
-            if self.lafan1_refresh_zarr_dataset is None:
+            if self.lafan1_refresh_zarr_dataset is False:
                 self.refresh_zarr_dataset = True
 
-        if self.lafan1_dataset_path is not None:
+        if self.lafan1_dataset_path != "":
             self.dataset_path = str(Path(self.lafan1_dataset_path).expanduser())
 
-        if self.lafan1_refresh_zarr_dataset is not None:
-            self.refresh_zarr_dataset = bool(self.lafan1_refresh_zarr_dataset)
+        if self.lafan1_refresh_zarr_dataset:
+            self.refresh_zarr_dataset = True
 
-        if self.lafan1_motions is not None and len(self.lafan1_motions) > 0:
+        if len(self.lafan1_motions) > 0:
             self.motions = list(self.lafan1_motions)
 
-        if self.lafan1_trajectories is not None and len(self.lafan1_trajectories) > 0:
+        if len(self.lafan1_trajectories) > 0:
             self.trajectories = list(self.lafan1_trajectories)
 
-        if self.lafan1_reset_schedule is not None:
+        if self.lafan1_reset_schedule != "":
             normalized_schedule = self.lafan1_reset_schedule.strip().lower()
             allowed = {"random", "sequential", "round_robin"}
             if normalized_schedule not in allowed:
@@ -852,13 +852,12 @@ class ImitationG1LafanTrackEnvCfg(ImitationG1BaseTrackingEnvCfg):
                 )
             self.reset_schedule = normalized_schedule
 
-        if self.lafan1_wrap_steps is not None:
-            self.wrap_steps = bool(self.lafan1_wrap_steps)
+        self.wrap_steps = bool(self.lafan1_wrap_steps)
 
-        if self.lafan1_reference_start_frame is not None:
+        if self.lafan1_reference_start_frame >= 0:
             self.reference_start_frame = int(self.lafan1_reference_start_frame)
 
-        if self.lafan1_control_freq is not None:
+        if self.lafan1_control_freq > 0.0:
             self.loader_kwargs["control_freq"] = float(self.lafan1_control_freq)
 
     def _sync_loader_frequency_from_sources(
