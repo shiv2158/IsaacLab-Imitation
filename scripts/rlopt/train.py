@@ -82,7 +82,7 @@ parser.add_argument(
     dest="algorithm",
     type=str.upper,
     default="PPO",
-    choices=["PPO", "SAC", "IPMD", "GAIL", "AMP", "ASE"],
+    choices=["PPO", "SAC", "FASTSAC", "IPMD", "GAIL", "AMP", "ASE"],
     help="RLOpt algorithm to train (must match the agent config).",
 )
 parser.add_argument(
@@ -145,7 +145,7 @@ from isaaclab.utils.dict import print_dict
 from isaaclab.utils.io import dump_yaml
 from isaaclab_imitation.envs.rlopt import IsaacLabTerminalObsReader, IsaacLabWrapper
 from isaaclab_tasks.utils.hydra import hydra_task_config
-from rlopt.agent import AMP, ASE, GAIL, IPMD, PPO, SAC
+from rlopt.agent import AMP, ASE, GAIL, IPMD, PPO, SAC, FastSAC
 from rlopt.config_base import RLOptConfig, TrainerConfig
 from torchrl.envs import (
     Compose,
@@ -162,9 +162,15 @@ torch.set_float32_matmul_precision("high")
 # import logger
 logger = logging.getLogger(__name__)
 
+WANDB_BACKEND = "wandb"
+WANDB_PROJECT = "FastSAC"
+WANDB_ENTITY = "dheddesheimer3-georgia-institute-of-technology"
+WANDB_GROUP = "g1_fastsac"
+
 ALGORITHM_CLASS_MAP = {
     "PPO": PPO,
     "SAC": SAC,
+    "FASTSAC": FastSAC,
     "IPMD": IPMD,
     "GAIL": GAIL,
     "AMP": AMP,
@@ -307,6 +313,10 @@ def main(
     dump_yaml(os.path.join(log_dir, "params", "env.yaml"), env_cfg)
     dump_yaml(os.path.join(log_dir, "params", "agent.yaml"), agent_cfg)
     agent_cfg.logger.log_dir = log_dir
+    agent_cfg.logger.backend = WANDB_BACKEND
+    agent_cfg.logger.project_name = WANDB_PROJECT
+    agent_cfg.logger.entity = WANDB_ENTITY
+    agent_cfg.logger.group_name = WANDB_GROUP
     # log command used to run the script
     command = " ".join(sys.orig_argv)
     (Path(log_dir) / "command.txt").write_text(command)
