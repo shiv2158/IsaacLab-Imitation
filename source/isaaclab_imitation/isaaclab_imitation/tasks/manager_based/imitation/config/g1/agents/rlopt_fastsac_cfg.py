@@ -1,3 +1,7 @@
+import os
+import tempfile
+from pathlib import Path
+
 from isaaclab.utils import configclass
 
 from isaaclab_imitation.envs.rlopt import FastSACRLOptConfig
@@ -33,6 +37,26 @@ class G1ImitationRLOptFastSACConfig(FastSACRLOptConfig):
 
         # Replay buffer (holosoma: buffer_size=1024 per env, ~4096 envs)
         self.replay_buffer.size = 1024 * 4096
+        if self.replay_buffer.scratch_dir is None and self.collector.scratch_dir is None:
+            scratch_root_env = os.environ.get("RLOPT_FASTSAC_REPLAY_SCRATCH_DIR")
+            if scratch_root_env is not None and len(scratch_root_env) > 0:
+                scratch_root = Path(scratch_root_env)
+            elif Path("/data").is_dir():
+                scratch_root = Path("/data/rlopt_replay")
+            else:
+                scratch_root = Path(tempfile.gettempdir()) / "rlopt_replay"
+
+            slurm_job_id = os.environ.get("SLURM_JOB_ID", "local")
+            replay_scratch_dir = scratch_root / f"rlopt_fastsac_replay_{slurm_job_id}"
+            try:
+                replay_scratch_dir.mkdir(parents=True, exist_ok=True)
+            except OSError:
+                replay_scratch_dir = Path(tempfile.gettempdir()) / (
+                    f"rlopt_fastsac_replay_{slurm_job_id}"
+                )
+                replay_scratch_dir.mkdir(parents=True, exist_ok=True)
+
+            self.replay_buffer.scratch_dir = str(replay_scratch_dir)
 
         # Loss (holosoma: gamma=0.97, batch_size=8192)
         self.loss.gamma = 0.97

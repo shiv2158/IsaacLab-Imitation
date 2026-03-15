@@ -150,9 +150,13 @@ class ImitationRLEnv(ManagerBasedRLEnv):
                 motions=motions,
                 trajectories=traj_names,
                 keys=keys,
-                device=torch.device("cuda:0"),
+                # TEMP HOTFIX: LazyMemmapStorage only supports CPU-backed memmap.
+                # Keep replay buffer storage on CPU until storage/device handling is redesigned.
+                device=torch.device("cpu"),
                 verbose_tree=False,
-                prefetch=3,
+                # prefetch requires a fixed batch_size at construction time (TorchRL limitation).
+                # Disable until batch_size is plumbed through from the agent config.
+                prefetch=0,
             )
         else:
             raise ValueError(
