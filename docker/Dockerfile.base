@@ -74,6 +74,8 @@ COPY --from=unitree_model /Go2W ${ISAACLAB_PATH}/unitree_model/Go2W
 COPY --from=unitree_model /H1 ${ISAACLAB_PATH}/unitree_model/H1
 COPY --from=unitree_model /H1-2 ${ISAACLAB_PATH}/unitree_model/H1-2
 COPY --from=unitree_model /README.md ${ISAACLAB_PATH}/unitree_model/README.md
+COPY --from=rlopt / ${ISAACLAB_PATH}/RLOpt
+COPY --from=iltools / ${ISAACLAB_PATH}/ImitationLearningTools
 
 # Old IsaacLab installation strategy.
 RUN chmod +x ${ISAACLAB_CORE_PATH}/isaaclab.sh
@@ -105,8 +107,15 @@ RUN ${ISAACLAB_CORE_PATH}/isaaclab.sh -p -c "from importlib import metadata; pac
 RUN --mount=type=cache,target=${DOCKER_USER_HOME}/.cache/pip \
     ${ISAACLAB_CORE_PATH}/isaaclab.sh -p -m pip install \
     -e ${ISAACLAB_PATH}/source/isaaclab_imitation \
-    -e ${ISAACLAB_PATH}/unitree_rl_lab/source/unitree_rl_lab
-RUN ${ISAACLAB_CORE_PATH}/isaaclab.sh -p -c "from importlib import metadata; packages=['isaaclab_imitation','unitree_rl_lab']; versions={name: metadata.version(name) for name in packages}; print('Verified installed local packages:', versions)"
+    -e ${ISAACLAB_PATH}/unitree_rl_lab/source/unitree_rl_lab \
+    -e ${ISAACLAB_PATH}/RLOpt \
+    -e ${ISAACLAB_PATH}/ImitationLearningTools
+RUN ${ISAACLAB_CORE_PATH}/isaaclab.sh -p -c "from importlib import metadata; packages=['isaaclab_imitation','unitree_rl_lab','rlopt','iltools']; versions={name: metadata.version(name) for name in packages}; print('Verified installed local packages:', versions)"
+
+# Pin numpy<2 (zarr pulls numpy>=2 but isaaclab requires <2) and install zarr after pinning.
+RUN ${ISAACLAB_CORE_PATH}/isaaclab.sh -p -m pip install "numpy<2" --force-reinstall && \
+    ${ISAACLAB_CORE_PATH}/isaaclab.sh -p -m pip install zarr --no-deps && \
+    ${ISAACLAB_CORE_PATH}/isaaclab.sh -p -m pip install numcodecs google-crc32c donfig
 RUN ${ISAACLAB_CORE_PATH}/isaaclab.sh -p -c "from pathlib import Path; root=Path('${UNITREE_MODEL_DIR}'); required=['B2','G1','Go2','Go2W','H1','H1-2']; missing=[name for name in required if not (root / name).exists()]; assert not missing, f'Missing Unitree model directories: {missing}'; print('Verified Unitree model directories:', ', '.join(required))"
 
 # Keep optional dependency behavior aligned with prior image.

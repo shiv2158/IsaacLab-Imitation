@@ -31,12 +31,12 @@ class G1ImitationRLOptFastSACConfig(FastSACRLOptConfig):
         self.q_function.num_cells = [768, 768]
 
         # Collector (holosoma: learning_starts=10, num_learning_iterations=50000)
-        self.collector.init_random_frames = 10
+        self.collector.init_random_frames = 0  # TODO(poc): restore to 10
         self.collector.frames_per_batch = 24
-        self.collector.total_frames = 50000 * 4096 * 24
+        self.collector.total_frames = 1_500_000  # TODO(poc): restore to 50000 * 4096 * 24  (~35 min at 32 envs/cpu)
 
         # Replay buffer (holosoma: buffer_size=1024 per env, ~4096 envs)
-        self.replay_buffer.size = 1024 * 4096
+        self.replay_buffer.size = 100_000  # TODO(poc): restore to 1024 * 4096
         if self.replay_buffer.scratch_dir is None and self.collector.scratch_dir is None:
             scratch_root_env = os.environ.get("RLOPT_FASTSAC_REPLAY_SCRATCH_DIR")
             if scratch_root_env is not None and len(scratch_root_env) > 0:
@@ -60,7 +60,7 @@ class G1ImitationRLOptFastSACConfig(FastSACRLOptConfig):
 
         # Loss (holosoma: gamma=0.97, batch_size=8192)
         self.loss.gamma = 0.97
-        self.loss.mini_batch_size = 8192
+        self.loss.mini_batch_size = 1024  # TODO(poc): restore to 8192
 
         # Optimizer (holosoma: lr=3e-4, weight_decay=0.001, tau=0.125)
         self.optim.lr = 3e-4
@@ -82,5 +82,5 @@ class G1ImitationRLOptFastSACConfig(FastSACRLOptConfig):
         self.sac.target_update_freq = 1
 
         # Compilation (holosoma: compile=True)
-        self.compile.compile = True
-        self.save_interval = 500
+        self.compile.compile = True  # TODO(poc): was disabled, re-enabled for speed
+        self.save_interval = 100  # TODO(poc): restore to 500

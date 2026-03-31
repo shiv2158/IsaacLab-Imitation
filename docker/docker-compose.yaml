@@ -84,6 +84,10 @@ x-default-isaac-lab-volumes: &default-isaac-lab-volumes
   - type: bind
     source: .isaac-lab-docker-history
     target: ${DOCKER_USER_HOME}/.bash_history
+    # WSL2: expose NVIDIA Vulkan/DirectX device and driver libraries
+  - type: bind
+    source: /usr/lib/wsl
+    target: /usr/lib/wsl
 x-default-isaac-lab-environment: &default-isaac-lab-environment
   - ISAACSIM_PATH=${DOCKER_ISAACLAB_PATH}/IsaacLab/_isaac_sim
   - ISAACLAB_PATH=${DOCKER_ISAACLAB_PATH}/IsaacLab
@@ -91,6 +95,9 @@ x-default-isaac-lab-environment: &default-isaac-lab-environment
   - OMNI_KIT_ALLOW_ROOT=1
   - UNITREE_MODEL_DIR=${DOCKER_ISAACLAB_PATH}/unitree_model
   - UNITREE_ROS_DIR=${DOCKER_ISAACLAB_PATH}/unitree_ros
+  - TORCHINDUCTOR_CACHE_DIR=/workspace/isaaclab/.torchinductor_cache
+  - NVIDIA_DRIVER_CAPABILITIES=all
+  - LD_LIBRARY_PATH=/usr/lib/wsl/lib
 
 x-default-isaac-lab-deploy: &default-isaac-lab-deploy
   resources:
@@ -98,7 +105,7 @@ x-default-isaac-lab-deploy: &default-isaac-lab-deploy
       devices:
         - driver: nvidia
           count: all
-          capabilities: [ gpu ]
+          capabilities: [ gpu, graphics, compute, utility ]
 
 services:
   # This service is the base Isaac Lab image
@@ -112,6 +119,8 @@ services:
         isaaclab: ../IsaacLab
         unitree_rl_lab: ../../unitree_rl_lab
         unitree_model: ../../unitree_model
+        rlopt: ../RLOpt
+        iltools: ../ImitationLearningTools
       args:
         - ISAACSIM_BASE_IMAGE_ARG=${ISAACSIM_BASE_IMAGE}
         - ISAACSIM_VERSION_ARG=${ISAACSIM_VERSION}
@@ -126,6 +135,9 @@ services:
       - /tmp:size=8G
     network_mode: host
     deploy: *default-isaac-lab-deploy
+    # WSL2: expose the DirectX/GPU kernel device for Vulkan
+    devices:
+      - /dev/dxg
     # Ensure IsaacLab's expected symlink exists even when the repo is bind-mounted from host.
     entrypoint:
       - /bin/bash
