@@ -92,6 +92,41 @@ parser.add_argument(
     default=None,
     help="Automatically configured by Ray integration, otherwise None.",
 )
+# Optional RLOpt / FastSAC hyperparameters for cluster sweeps (avoid editing Hydra YAML per job).
+parser.add_argument(
+    "--rlopt-target-tau",
+    type=float,
+    default=None,
+    help=(
+        "Soft target update rate τ for Polyak averaging: sets "
+        "optim.target_update_polyak = 1.0 - τ. "
+        "Typical SAC uses τ≈0.005; your G1 config used τ=0.125 (very fast targets)."
+    ),
+)
+parser.add_argument(
+    "--rlopt-replay-size",
+    type=int,
+    default=None,
+    help="Override replay_buffer.size (e.g. 2000000 for a larger reservoir).",
+)
+parser.add_argument(
+    "--rlopt-feature-update-ratio",
+    type=int,
+    default=None,
+    help="Override sac.feature_update_ratio (FastSAC critic steps per collector step).",
+)
+parser.add_argument(
+    "--rlopt-mini-batch-size",
+    type=int,
+    default=None,
+    help="Override loss.mini_batch_size for SGD batches from the replay buffer.",
+)
+parser.add_argument(
+    "--wandb-exp-suffix",
+    type=str,
+    default=None,
+    help="Appended to logger.exp_name so parallel sweeps are easy to tell apart in W&B.",
+)
 # append AppLauncher cli args
 AppLauncher.add_app_launcher_args(parser)
 # parse the arguments
@@ -264,6 +299,31 @@ args_cli.agent = resolve_agent_cfg_entry_point(
 )
 
 
+def apply_rlopt_cli_hyperparams(agent_cfg: RLOptConfig, args_cli: argparse.Namespace) -> None:
+    """Apply optional CLI overrides after Hydra loads the agent config (for cluster sweeps)."""
+    if args_cli.rlopt_target_tau is not None:
+        tau = float(args_cli.rlopt_target_tau)
+        if not (0.0 < tau <= 1.0):
+            raise ValueError(f"--rlopt-target-tau must be in (0, 1], got {tau}")
+        agent_cfg.optim.target_update_polyak = 1.0 - tau
+    if args_cli.rlopt_replay_size is not None:
+        agent_cfg.replay_buffer.size = int(args_cli.rlopt_replay_size)
+    if args_cli.rlopt_feature_update_ratio is not None:
+        sac = getattr(agent_cfg, "sac", None)
+        if sac is None or not hasattr(sac, "feature_update_ratio"):
+            logger.warning(
+                "Ignoring --rlopt-feature-update-ratio: config has no "
+                "sac.feature_update_ratio (use FastSAC)."
+            )
+        else:
+            sac.feature_update_ratio = int(args_cli.rlopt_feature_update_ratio)
+    if args_cli.rlopt_mini_batch_size is not None:
+        agent_cfg.loss.mini_batch_size = int(args_cli.rlopt_mini_batch_size)
+    if args_cli.wandb_exp_suffix:
+        base = agent_cfg.logger.exp_name
+        agent_cfg.logger.exp_name = f"{base}_{args_cli.wandb_exp_suffix}"
+
+
 @hydra_task_config(args_cli.task, args_cli.agent)
 def main(
     env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg,
@@ -292,6 +352,7 @@ def main(
             * env_cfg.scene.num_envs
         )
     agent_cfg.collector.frames_per_batch *= env_cfg.scene.num_envs
+    apply_rlopt_cli_hyperparams(agent_cfg, args_cli)
     # set the environment seed
     # note: certain randomizations occur in the environment initialization so we set the seed here
     env_cfg.seed = agent_cfg.seed
