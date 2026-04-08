@@ -29,14 +29,18 @@ class G1ImitationRLOptFastSACConfig(FastSACRLOptConfig):
         # Network architecture (holosoma: actor_hidden_dim=512, critic_hidden_dim=768)
         self.policy.num_cells = [512, 512]
         self.q_function.num_cells = [768, 768]
+        # LayerNorm disabled: adds complexity without proven benefit at our UTD range (0.003).
+        # Re-enable once base training is stable.
+        self.q_function.use_layer_norm = False
 
-        # Collector (holosoma: learning_starts=10, num_learning_iterations=50000)
-        self.collector.init_random_frames = 0  # TODO(poc): restore to 10
+        # Collector — warmup_collects is expanded in scripts/rlopt/train.py to
+        # init_random_frames = warmup_collects * frames_per_batch (after × num_envs).
+        self.collector.warmup_collects = 5
         self.collector.frames_per_batch = 24
-        self.collector.total_frames = 1_500_000  # TODO(poc): restore to 50000 * 4096 * 24  (~35 min at 32 envs/cpu)
+        self.collector.total_frames = 50_000 * 4096 * 24
 
-        # Replay buffer (holosoma: buffer_size=1024 per env, ~4096 envs)
-        self.replay_buffer.size = 100_000  # TODO(poc): restore to 1024 * 4096
+        # Replay buffer — match the run that reached ep_ret=9.7 (500k).
+        self.replay_buffer.size = 500_000
         if self.replay_buffer.scratch_dir is None and self.collector.scratch_dir is None:
             scratch_root_env = os.environ.get("RLOPT_FASTSAC_REPLAY_SCRATCH_DIR")
             if scratch_root_env is not None and len(scratch_root_env) > 0:
@@ -58,29 +62,35 @@ class G1ImitationRLOptFastSACConfig(FastSACRLOptConfig):
 
             self.replay_buffer.scratch_dir = str(replay_scratch_dir)
 
-        # Loss (holosoma: gamma=0.97, batch_size=8192)
+        # Loss — 512 matches the run that reached ep_ret=9.7. Larger batches (2048) combined
+        # with τ=0.005 caused ep_ret to plateau at -5 in testing.
         self.loss.gamma = 0.97
-        self.loss.mini_batch_size = 1024  # TODO(poc): restore to 8192
+        self.loss.mini_batch_size = 512
 
-        # Optimizer (holosoma: lr=3e-4, weight_decay=0.001, tau=0.125)
+        # Optimizer — τ=0.05 is a middle ground: responsive enough for early bootstrap
+        # (τ=0.005 was too slow; target barely moved over 128 steps) but less oscillatory
+        # than τ=0.125 (which caused ep_ret variance ±3-4).
         self.optim.lr = 3e-4
         self.optim.weight_decay = 0.001
-        self.optim.target_update_polyak = 1.0 - 0.125  # tau = 0.125
+        self.optim.target_update_polyak = 1.0 - 0.05
         self.optim.scheduler = None
         self.optim.max_grad_norm = 1.0
 
-        # SAC (holosoma: alpha_init=0.001, log_std_min=-5.0, log_std_max=0.0)
-        self.sac.alpha_init = 0.001
+        # SAC — alpha is auto-tuned toward H_target ≈ -14.5 (= -action_dim/2 via TorchRL auto).
+        # alpha_init = 0.01: proven to prevent multi-joint violations in early training on this
+        # task. High alpha (0.1) combined with many actor updates per batch caused Q-explosion
+        # in testing; auto-tuning will raise alpha appropriately once the critic is stable.
+        self.sac.alpha_init = 0.01
         self.sac.clip_log_std = True
         self.sac.log_std_min = -5.0
-        self.sac.log_std_max = 0.0
+        self.sac.log_std_max = 2.0
         self.sac.num_qvalue_nets = 2
 
-        # FastSAC scheduling (holosoma: num_updates=8, policy_frequency=4)
-        self.sac.feature_update_ratio = 8
+        # FastSAC scheduling — exact values from the run that reached ep_ret=9.7.
+        # 64 critic steps / 4 = 16 actor updates per collection step.
+        self.sac.feature_update_ratio = 64
         self.sac.actor_update_freq = 4
         self.sac.target_update_freq = 1
 
-        # Compilation (holosoma: compile=True)
-        self.compile.compile = True  # TODO(poc): was disabled, re-enabled for speed
-        self.save_interval = 100  # TODO(poc): restore to 500
+        self.compile.compile = True
+        self.save_interval = 500

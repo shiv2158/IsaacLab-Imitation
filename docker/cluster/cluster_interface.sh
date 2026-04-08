@@ -125,7 +125,8 @@ sync_tree_to_cluster() {
     fi
 
     echo "[INFO] Syncing $label from '$src_path' -> '$CLUSTER_LOGIN:$dst_path'"
-    ssh "$CLUSTER_LOGIN" "mkdir -p '$dst_path'"
+    # Recreate destination (rsync does not replace a non-directory at dst_path).
+    ssh "$CLUSTER_LOGIN" "set -e; parent=\$(dirname \"$dst_path\"); mkdir -p \"\$parent\"; rm -rf \"$dst_path\"; mkdir -p \"$dst_path\""
     rsync_cmd=(
         rsync -rh
         --exclude="*.git*"
@@ -198,7 +199,11 @@ fi
 
 mkdir -p "$(dirname "$target_dir")"
 
-if [ -d "$target_dir/.git" ]; then
+# Use a real git check: submodules often use a *file* .git (gitdir pointer), so
+# `[ -d "$target_dir/.git" ]` misses them and `git clone` into the path fails with
+# "could not create work tree dir ... File exists" after the parent repo ran
+# `submodule update` into the same directory.
+if git -C "$target_dir" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
     current_origin="$(git -C "$target_dir" remote get-url origin 2>/dev/null || true)"
     if [ "$current_origin" != "$origin_url" ]; then
         rm -rf "$target_dir"
@@ -207,7 +212,10 @@ elif [ -e "$target_dir" ]; then
     rm -rf "$target_dir"
 fi
 
-if [ ! -d "$target_dir/.git" ]; then
+if ! git -C "$target_dir" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    # Submodule checkouts from the parent clone can leave a non-repo or half-updated
+    # tree; cloning into an existing path then fails with "File exists".
+    rm -rf "$target_dir"
     git clone --no-checkout "$origin_url" "$target_dir"
 fi
 
@@ -454,6 +462,27 @@ append_repo_manifest_entry() {
     echo "[INFO] Repo snapshot: name='$repo_name' remote_subdir='$remote_subdir' sha='$head_sha' branch='$branch' state='$state' changed_files='$changed_files' local_path='$resolved_local_path'"
 }
 
+# Left-hand sides in CLUSTER_EXTRA_SYNC_SPECS may be absolute or relative to the
+# IsaacLab-Imitation repo root (parent of docker/). Relative paths avoid broken
+# overlays when submitting from WSL (/mnt/c/...) vs native Linux (/home/...).
+resolve_cluster_sync_local_path() {
+    local workspace_root="$1"
+    local raw_path="$2"
+
+    if [ -z "$raw_path" ]; then
+        printf '%s\n' "$raw_path"
+        return
+    fi
+    case "$raw_path" in
+        /*)
+            ;;
+        *)
+            raw_path="${workspace_root}/${raw_path#./}"
+            ;;
+    esac
+    realpath "$raw_path" 2>/dev/null || printf '%s\n' "$raw_path"
+}
+
 record_repo_sync_manifest() {
     local local_workspace_root
     local manifest_local_file
@@ -483,6 +512,7 @@ record_repo_sync_manifest() {
         if [ -z "$local_path" ] || [ -z "$remote_subdir" ]; then
             continue
         fi
+        local_path="$(resolve_cluster_sync_local_path "$local_workspace_root" "$local_path")"
         append_repo_manifest_entry "$manifest_local_file" "$remote_subdir" "$local_path" "$remote_subdir"
     done
 
@@ -541,7 +571,11 @@ sync_extra_repos() {
             display_warning "Ignoring invalid CLUSTER_EXTRA_SYNC_SPECS entry: '$spec'"
             continue
         fi
-        local_path="$(realpath "$local_path" 2>/dev/null || echo "$local_path")"
+        local_path="$(resolve_cluster_sync_local_path "$local_workspace_root" "$local_path")"
+        # Parent repo init may have already populated this path via `submodule update`;
+        # remove it so overlay git/rsync always starts from a clean target.
+        echo "[INFO] Clearing remote overlay path before sync: '$CLUSTER_ISAACLAB_DIR/$remote_subdir'"
+        ssh "$CLUSTER_LOGIN" "rm -rf \"$CLUSTER_ISAACLAB_DIR/$remote_subdir\""
         sync_repo_prefer_git_then_rsync "$local_path" "$CLUSTER_ISAACLAB_DIR/$remote_subdir" "$remote_subdir" "$remote_subdir"
     done
 }

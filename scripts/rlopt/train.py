@@ -11,6 +11,14 @@ import signal
 import sys
 from pathlib import Path
 
+# Isaac Sim's kit Python ships a stale `rlopt` in site-packages that can shadow the
+# project's RLOpt submodule (missing FastSACRLOptConfig, etc.). Prefer the repo checkout.
+_RLOPT_REPO = Path(__file__).resolve().parent.parent.parent / "RLOpt"
+if (_RLOPT_REPO / "rlopt").is_dir():
+    _RLOPT_ROOT = str(_RLOPT_REPO)
+    if _RLOPT_ROOT not in sys.path:
+        sys.path.insert(0, _RLOPT_ROOT)
+
 import torch
 from isaaclab.app import AppLauncher
 
@@ -352,6 +360,13 @@ def main(
             * env_cfg.scene.num_envs
         )
     agent_cfg.collector.frames_per_batch *= env_cfg.scene.num_envs
+    # Convert warmup_collects → init_random_frames now that frames_per_batch is finalized.
+    # warmup_collects is set in task configs; the base CollectorConfig default (1000) is
+    # far too small for vectorized envs (1 batch = num_envs * fpb >> 1000).
+    if agent_cfg.collector.warmup_collects is not None:
+        agent_cfg.collector.init_random_frames = (
+            agent_cfg.collector.warmup_collects * agent_cfg.collector.frames_per_batch
+        )
     apply_rlopt_cli_hyperparams(agent_cfg, args_cli)
     # set the environment seed
     # note: certain randomizations occur in the environment initialization so we set the seed here
@@ -422,6 +437,12 @@ def main(
             observation_spec=env.observation_spec, backend="gymnasium"
         )  # type: ignore
     )
+    # NOTE: ObservationNorm (running mean/std) is strongly recommended for 29-DoF humanoid
+    # (PHC, AMP, ASE all use it). However, G1 uses concatenate_terms=False so observations
+    # are nested tensors per term (("policy","joint_vel_rel") etc.), not a single "policy"
+    # tensor. Correct implementation requires either: (a) set concatenate_terms=True in
+    # the policy obs group and update policy.input_keys=["policy"], or (b) apply separate
+    # ObservationNorm per nested key. Deferred to avoid a runtime crash.
     env = TransformedEnv(
         env=env,
         transform=Compose(

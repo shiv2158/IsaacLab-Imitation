@@ -64,7 +64,6 @@ if [ -n "\$mail_user" ] && [ -n "\$email_logs_on" ]; then
 	esac
 
 	if [ "\$should_email_logs" -eq 1 ] && command -v mail >/dev/null 2>&1; then
-		out_log="\${SLURM_SUBMIT_DIR:-\$PWD}/output_\${SLURM_JOB_ID:-unknown}.log"
 		err_log="\${SLURM_SUBMIT_DIR:-\$PWD}/error_\${SLURM_JOB_ID:-unknown}.log"
 		status_label="SUCCESS"
 		if [ "\$job_exit_code" -ne 0 ]; then
@@ -80,13 +79,6 @@ if [ -n "\$mail_user" ] && [ -n "\$email_logs_on" ]; then
 			echo "exit_code=\${job_exit_code}"
 			echo "host=\$(hostname)"
 			echo
-			echo "===== tail -n \${email_log_tail_lines} \${out_log} ====="
-			if [ -f "\$out_log" ]; then
-				tail -n "\$email_log_tail_lines" "\$out_log"
-			else
-				echo "(missing)"
-			fi
-			echo
 			echo "===== tail -n \${email_log_tail_lines} \${err_log} ====="
 			if [ -f "\$err_log" ]; then
 				tail -n "\$email_log_tail_lines" "\$err_log"
@@ -95,7 +87,7 @@ if [ -n "\$mail_user" ] && [ -n "\$email_logs_on" ]; then
 			fi
 		} > "\$tmp_mail_body"
 
-		mail -s "[SLURM][\${SLURM_JOB_ID:-unknown}] \${status_label} log tail" "\$mail_user" < "\$tmp_mail_body" || true
+		mail -s "[SLURM][\${SLURM_JOB_ID:-unknown}] \${status_label} error log tail" "\$mail_user" < "\$tmp_mail_body" || true
 		rm -f "\$tmp_mail_body"
 	fi
 fi
