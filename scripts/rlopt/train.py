@@ -90,7 +90,16 @@ parser.add_argument(
     dest="algorithm",
     type=str.upper,
     default="PPO",
-    choices=["PPO", "SAC", "FASTSAC", "IPMD", "GAIL", "AMP", "ASE"],
+    choices=[
+        "PPO",
+        "SAC",
+        "FASTSAC",
+        "IPMD",
+        "IPMD_FASTSAC",
+        "GAIL",
+        "AMP",
+        "ASE",
+    ],
     help="RLOpt algorithm to train (must match the agent config).",
 )
 parser.add_argument(
@@ -215,6 +224,7 @@ ALGORITHM_CLASS_MAP = {
     "SAC": SAC,
     "FASTSAC": FastSAC,
     "IPMD": IPMD,
+    "IPMD_FASTSAC": IPMD,
     "GAIL": GAIL,
     "AMP": AMP,
     "ASE": ASE,
