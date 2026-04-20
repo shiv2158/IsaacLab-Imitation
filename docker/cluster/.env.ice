@@ -54,7 +54,7 @@ CLUSTER_WANDB_API_KEY_FILE=.wandb_api_key
 CLUSTER_G1_MANIFEST_REFRESH_POLICY=never
 # Home directory path inside singularity container.
 # This path is backed by ${CLUSTER_ISAAC_SIM_CACHE_DIR}/home on scratch.
-#CLUSTER_CONTAINER_HOME=/home/hice1/fwu91
+#CLUSTER_CONTAINER_HOME=/home/hice1/dheddesheimer3
 # Remove the temporary isaaclab code copy after the job is done
 REMOVE_CODE_COPY_AFTER_JOB=true
 # Remove the temporary apptainer overlay after the job is done
@@ -74,9 +74,9 @@ CLUSTER_PYTHON_EXECUTABLE=scripts/rlopt/train.py
 # Uncomment only the repos you want overlaid from local working trees.
 # Example: uncomment CLUSTER_RLOPT_LOCAL_PATH to sync your local RLOpt checkout and apply git diff/untracked files there.
 # These are paths on the submission machine (where cluster_interface.sh runs), not paths on the remote cluster.
-# CLUSTER_ISAACLAB_LOCAL_PATH=/home/fwu/Documents/Research/SkillLearning/IsaacLab
-CLUSTER_RLOPT_LOCAL_PATH=/home/fwu91/Documents/Research/SkillLearning/RLOpt
-# CLUSTER_IMITATION_TOOLS_LOCAL_PATH=/home/fwu/Documents/Research/SkillLearning/ImitationLearningTools
+# CLUSTER_ISAACLAB_LOCAL_PATH=/home/hice1/dheddesheimer3/Documents/Research/SkillLearning/IsaacLab
+CLUSTER_RLOPT_LOCAL_PATH=/home/hice1/dheddesheimer3/Documents/Research/SkillLearning/RLOpt
+# CLUSTER_IMITATION_TOOLS_LOCAL_PATH=/home/hice1/dheddesheimer3/Documents/Research/SkillLearning/ImitationLearningTools
 # Extra PYTHONPATH entries inside container, relative to /workspace/isaaclab/project.
 # This should match the remote_subdir values above.
 CLUSTER_EXTRA_PYTHONPATH_REL=IsaacLab/source/isaaclab:IsaacLab/source/isaaclab_tasks:IsaacLab/source/isaaclab_assets:IsaacLab/source/isaaclab_rl:IsaacLab/source/isaaclab_mimic:source/isaaclab_imitation:unitree_rl_lab/source/unitree_rl_lab:RLOpt:ImitationLearningTools
