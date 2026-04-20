@@ -1,8 +1,8 @@
 # IsaacLab-Imitation
 
 IsaacLab-Imitation is a multi-repo workspace for humanoid imitation learning on top of Isaac Lab. This repository
-contains the Isaac Lab extension code for the imitation environments, while the workspace also vendors the
-`IsaacLab`, `RLOpt`, and `ImitationLearningTools` repositories as git submodules.
+contains the Isaac Lab extension code for the imitation environments, while the workspace also vendors or assumes local
+checkouts of the upstream `IsaacLab`, `RLOpt`, and `ImitationLearningTools` repositories (typically as git submodules).
 
 The current focus is manager-based imitation environments for the Unitree G1 robot, with training flows built around
 RLOpt and RSL-RL.
@@ -18,14 +18,13 @@ RLOpt and RSL-RL.
 
 Registered task IDs currently include:
 
-- `Isaac-Imitation-G1-LafanTrack-v0`
-- `Isaac-Imitation-G1-Dance102-Compare-v0`
 - `Isaac-Imitation-G1-v0`
-- `Isaac-Imitation-G1-Dance102-v0`
+- `Isaac-Imitation-G1-Latent-v0`
+- `Isaac-Imitation-G1-LafanTrack-v0` (legacy alias of `Isaac-Imitation-G1-v0`)
 
 ## Workspace setup
 
-Clone with submodules:
+Clone with submodules (recommended layout, with `IsaacLab` etc. as submodules inside this repo):
 
 ```bash
 git clone --recurse-submodules git@github.com:GTLIDAR/IsaacLab-Imitation.git
@@ -39,7 +38,26 @@ git submodule sync --recursive
 git submodule update --init --recursive
 ```
 
-This workspace also expects `unitree_rl_lab` as a sibling checkout for training and cluster workflows:
+This workspace also expects the upstream `IsaacLab`, `unitree_rl_lab`, and `loco-mujoco` repositories to be available
+either as submodules in this repo (under directories such as `IsaacLab/`) or as sibling checkouts next to it.
+
+When using sibling checkouts, a typical layout looks like:
+
+```text
+/path/to/workspace-root/
+  IsaacLab-Imitation/
+  IsaacLab/
+  unitree_rl_lab/
+  loco-mujoco/
+```
+
+In that case, make sure your Python tooling and environment configuration (for example, `PYTHONPATH` or editable
+installs) can see all of these repositories.
+
+If you are following the submodule-based layout, `IsaacLab` and the other vendored repos will live directly under
+`IsaacLab-Imitation/` instead.
+
+This workspace also expects `unitree_rl_lab` specifically as a sibling checkout for training and cluster workflows:
 
 ```bash
 cd ..
@@ -76,32 +94,97 @@ If you need the manual submodule setup details or cluster notes, see [REPO_SETUP
 ## Running training
 
 Examples below assume you are running from the repository root.
+Activate the `SkillLearning` conda environment first:
+
+```bash
+conda activate SkillLearning
+```
 
 Train a G1 imitation policy with RLOpt IPMD:
 
 ```bash
-./IsaacLab/isaaclab.sh -p scripts/rlopt/train.py \
-    --task Isaac-Imitation-G1-LafanTrack-v0 \
+python scripts/rlopt/train.py \
+    --task Isaac-Imitation-G1-Latent-v0 \
     --algo IPMD \
-    --headless
+    --headless \
+    env.lafan1_manifest_path=./data/lafan1/manifests/g1_lafan1_manifest.json
+```
+
+For imitation-based RL, the recommended starting point in this repo is RLOpt IPMD on
+`Isaac-Imitation-G1-Latent-v0`. If you want a smaller single-motion setup for the
+retargeted Unitree `dance102` clip, use:
+
+```bash
+python scripts/rlopt/train.py \
+    --task Isaac-Imitation-G1-Latent-v0 \
+    --algo IPMD \
+    --headless \
+    env.lafan1_manifest_path=./data/unitree/manifests/g1_unitree_dance102_manifest.json
 ```
 
 Train with RLOpt PPO:
 
 ```bash
-./IsaacLab/isaaclab.sh -p scripts/rlopt/train.py \
-    --task Isaac-Imitation-G1-LafanTrack-v0 \
+python scripts/rlopt/train.py \
+    --task Isaac-Imitation-G1-v0 \
     --algo PPO \
-    --headless
+    --headless \
+    env.lafan1_manifest_path=./data/lafan1/manifests/g1_lafan1_manifest.json
 ```
+
+Train ASE with the full local LAFAN1 G1 manifest:
+
+```bash
+python scripts/rlopt/train.py \
+    --task Isaac-Imitation-G1-Latent-v0 \
+    --num_envs 4096 \
+    --algo ASE \
+    --headless \
+    --video \
+    env.lafan1_manifest_path=./data/lafan1/manifests/g1_lafan1_manifest.json
+```
+
+Train latent-conditioned IPMD with the same manifest:
+
+```bash
+python scripts/rlopt/train.py \
+    --task Isaac-Imitation-G1-Latent-v0 \
+    --algo IPMD \
+    --headless \
+    env.lafan1_manifest_path=./data/lafan1/manifests/g1_lafan1_manifest.json
+```
+
+To run IPMD on the vanilla tracking task instead, disable latent commands explicitly:
+
+```bash
+python scripts/rlopt/train.py \
+    --task Isaac-Imitation-G1-v0 \
+    --algo IPMD \
+    --headless \
+    env.lafan1_manifest_path=./data/lafan1/manifests/g1_lafan1_manifest.json \
+    ipmd.use_latent_command=False
+```
+
+If you want to reuse an existing cached Zarr dataset instead of rebuilding it on startup, add:
+
+```bash
+env.refresh_zarr_dataset=False
+```
+
+For manifest-driven G1 tasks, the cache path is derived from the resolved manifest path and contents, so LaFAN1 and
+Unitree manifests do not share the same Zarr dataset by default.
 
 Train with RSL-RL:
 
 ```bash
-./IsaacLab/isaaclab.sh -p scripts/rsl_rl/train.py \
-    --task Isaac-Imitation-G1-LafanTrack-v0 \
-    --headless
+python scripts/rsl_rl/train.py \
+    --task Isaac-Imitation-G1-v0 \
+    --headless \
+    env.lafan1_manifest_path=./data/lafan1/manifests/g1_lafan1_manifest.json
 ```
+
+`Isaac-Imitation-G1-LafanTrack-v0` remains registered as a backward-compatible alias to
+`Isaac-Imitation-G1-v0`, but new commands should prefer `Isaac-Imitation-G1-v0`.
 
 Common flags:
 
@@ -115,42 +198,162 @@ Logs are written under `logs/`.
 
 ## Data preparation
 
-`unitree_rl_lab` is part of the expected local setup for two reasons:
+Motion loading in this repo is manifest-driven and repo-local under `data/`.
 
-- some training and evaluation flows depend on its robot/task assets and config
-- the dance mimic data conversion pipeline uses its `scripts/mimic/csv_to_npz.py` converter
+Tracked manifests:
 
-For dance tasks that use mimic motion data, convert the source CSV into NPZ before running the task.
+- `source/isaaclab_imitation/isaaclab_imitation/manifests/g1_lafan1_manifest.template.json`: tracked template for a
+  full local G1 LAFAN1 manifest
 
-The bundled `dance_102` CSV lives at:
+Local manifests:
 
-```text
-../unitree_rl_lab/source/unitree_rl_lab/unitree_rl_lab/tasks/mimic/robots/g1_29dof/dance_102/G1_Take_102.bvh_60hz.csv
-```
+- `data/lafan1/manifests/g1_lafan1_manifest.json`: full local G1 LAFAN1 manifest
+- `data/lafan1/manifests/g1_debug_manifest.json`: optional smaller local subset
+- `data/unitree/manifests/g1_unitree_dance102_manifest.json`: single-motion Unitree
+  `dance102` manifest pointing at `data/unitree/npz/g1/G1_Take_102.bvh_60hz.npz`
 
-Run the converter like this:
+The full local G1 set is not shipped in git. When you prepare local motions under `data/lafan1/npz/g1/`, the full
+manifest should live under `data/lafan1/manifests/g1_lafan1_manifest.json`.
 
-```bash
-python ../unitree_rl_lab/scripts/mimic/csv_to_npz.py \
-    --input_file ../unitree_rl_lab/source/unitree_rl_lab/unitree_rl_lab/tasks/mimic/robots/g1_29dof/dance_102/G1_Take_102.bvh_60hz.csv
-```
+The Unitree `dance102` manifest is useful for quick smoke tests and smaller imitation-based
+RL runs before scaling up to the full LAFAN1 manifest.
 
-This generates the `.npz` file next to the CSV, in the same directory.
+See `data/README.md` for the expected local directory layout and the common local-data commands.
 
-For `dance_102`, the generated output is:
+### Recommended full-dataset flow
 
-```text
-../unitree_rl_lab/source/unitree_rl_lab/unitree_rl_lab/tasks/mimic/robots/g1_29dof/dance_102/G1_Take_102.bvh_60hz.npz
-```
-
-If you are preparing a larger set of CSV motions for the LAFAN-style loader in this repo, use:
+The simplest way to get the full local G1 dataset from the public Hugging Face dataset
+`lvhaidong/LAFAN1_Retargeting_Dataset` is the shell wrapper:
 
 ```bash
-python scripts/prepare_lafan1_from_csv.py \
+./scripts/download_g1_lafan1_data.sh
+```
+
+This downloads the G1 subset into `data/` and then runs the local NPZ + manifest preparation step.
+To bake the G1 arms-up alignment trim into the generated NPZ files, pass
+`--auto_trim_mode g1_shoulder_roll`.
+
+The underlying Python entrypoint is:
+
+```bash
+conda run -n SkillLearning python scripts/setup_lafan1_dataset.py \
+    --prepare-npz --headless
+```
+
+For the G1 retargeted set, the public CSV motions often begin with an arms-up
+alignment pose. To bake a per-motion trim into the generated NPZ files, add:
+
+```bash
+conda run -n SkillLearning python scripts/setup_lafan1_dataset.py \
+    --prepare-npz --headless \
+    --auto_trim_mode g1_shoulder_roll
+```
+
+Both commands download the public retargeted LAFAN1 G1 CSV set, convert it to NPZ, and write:
+
+```text
+data/lafan1/raw/g1/
+data/lafan1/npz/g1/
+data/lafan1/manifests/g1_lafan1_manifest.json
+```
+
+The Hugging Face dataset stores the retargeted G1 motions at 30 FPS, so the wrapper passes `--input_fps 30`
+automatically during conversion. Use `--robot_type h1`, `--robot_type h1_2`, or `--robot_type all` for other subsets.
+
+### If You Already Have NPZ Files
+
+If `data/lafan1/manifests/g1_lafan1_manifest.json` already exists, you do not need to regenerate it.
+
+If you already have local NPZ files but no manifest yet, generate one directly:
+
+```bash
+conda run -n SkillLearning python scripts/write_lafan1_npz_manifest.py \
+    --npz_dir data/lafan1/npz/g1 \
+    --manifest_path data/lafan1/manifests/g1_lafan1_manifest.json
+```
+
+If you want to hand-edit a manifest instead of generating one, copy the tracked template:
+
+```bash
+mkdir -p data/lafan1/manifests
+cp source/isaaclab_imitation/isaaclab_imitation/manifests/g1_lafan1_manifest.template.json \
+   data/lafan1/manifests/g1_lafan1_manifest.json
+```
+
+For a smaller local subset:
+
+```bash
+conda run -n SkillLearning python scripts/write_lafan1_npz_manifest.py \
+    --npz_dir data/lafan1/npz/g1 \
+    --manifest_path data/lafan1/manifests/g1_debug_manifest.json \
+    --select dance1_subject1 dance1_subject2 walk1_subject1
+```
+
+### If You Start From CSV Files
+
+Prepare local CSV motions into NPZ plus a manifest with:
+
+```bash
+conda run -n SkillLearning python scripts/prepare_lafan1_from_csv.py \
     --csv_dir /absolute/path/to/csv_motions \
-    --npz_dir /absolute/path/to/npz_motions \
-    --manifest_path /absolute/path/to/g1_lafan1_manifest.json \
+    --npz_dir /absolute/path/to/data/lafan1/npz/g1 \
+    --manifest_path /absolute/path/to/data/lafan1/manifests/g1_lafan1_manifest.json \
     --recursive
+```
+
+If you want one replay MP4 per converted motion, add `--record_videos` and `--video_dir`.
+
+To auto-trim the G1 arms-up alignment segment while rebuilding NPZ files, add:
+
+```bash
+conda run -n SkillLearning python scripts/prepare_lafan1_from_csv.py \
+    --csv_dir /absolute/path/to/csv_motions \
+    --npz_dir /absolute/path/to/data/lafan1/npz/g1 \
+    --manifest_path /absolute/path/to/data/lafan1/manifests/g1_lafan1_manifest.json \
+    --recursive \
+    --auto_trim_mode g1_shoulder_roll \
+    --overwrite
+```
+
+That trims each CSV before conversion, writes clean NPZ files suitable for
+upload to Hugging Face, and records the source trim range in the manifest as
+provenance.
+
+If you already have NPZ files and only want a trimmed manifest without
+rewriting those NPZ files, use:
+
+```bash
+conda run -n SkillLearning python scripts/prepare_lafan1_from_csv.py \
+    --csv_dir /absolute/path/to/csv_motions \
+    --npz_dir /absolute/path/to/data/lafan1/npz/g1 \
+    --manifest_path /absolute/path/to/data/lafan1/manifests/g1_lafan1_manifest.json \
+    --recursive \
+    --assume_npz_exists \
+    --auto_trim_mode g1_shoulder_roll
+```
+
+In that mode the per-motion trim is written into each manifest entry as
+`frame_range`, leaving the NPZ payload unchanged.
+
+### Direct NPZ Sync With Hugging Face
+
+If you only want the prepared NPZ subtree, use:
+
+```bash
+conda run -n SkillLearning python scripts/setup_g1_lafan1_npz_dataset.py
+```
+
+That syncs `npz/g1` from the dataset repo `GeorgiaTech/g1_lafan1_50hz` into:
+
+```text
+data/lafan1/npz/g1/
+```
+
+Upload mode pushes the same local NPZ tree back to Hugging Face:
+
+```bash
+conda run -n SkillLearning python scripts/setup_g1_lafan1_npz_dataset.py \
+    --mode upload --token "$HF_TOKEN"
 ```
 
 ## Playback and smoke tests
@@ -158,24 +361,52 @@ python scripts/prepare_lafan1_from_csv.py \
 Run a zero-action smoke test:
 
 ```bash
-./IsaacLab/isaaclab.sh -p scripts/zero_agent.py \
-    --task Isaac-Imitation-G1-LafanTrack-v0
+python scripts/zero_agent.py \
+    --task Isaac-Imitation-G1-v0 \
+    env.lafan1_manifest_path=./data/lafan1/manifests/g1_lafan1_manifest.json
 ```
 
 Run a random-action smoke test:
 
 ```bash
-./IsaacLab/isaaclab.sh -p scripts/random_agent.py \
-    --task Isaac-Imitation-G1-LafanTrack-v0
+python scripts/random_agent.py \
+    --task Isaac-Imitation-G1-v0 \
+    env.lafan1_manifest_path=./data/lafan1/manifests/g1_lafan1_manifest.json
 ```
 
 Play back an RLOpt checkpoint:
 
 ```bash
-./IsaacLab/isaaclab.sh -p scripts/rlopt/play.py \
-    --task Isaac-Imitation-G1-LafanTrack-v0 \
-    --checkpoint /absolute/path/to/checkpoint.pt
+python scripts/rlopt/play.py \
+    --task Isaac-Imitation-G1-v0 \
+    --checkpoint /absolute/path/to/checkpoint.pt \
+    env.lafan1_manifest_path=./data/lafan1/manifests/g1_lafan1_manifest.json
 ```
+
+Replay all 40 local G1 LAFAN1 motions from the full manifest:
+
+```bash
+python scripts/replay_reference.py \
+    --task Isaac-Imitation-G1-v0 \
+    --motion_manifest data/lafan1/manifests/g1_lafan1_manifest.json \
+    --motion_refresh_dataset \
+    --reset_schedule round_robin \
+    --num_envs 40 \
+    --video \
+    --video_length 500 \
+    --headless
+```
+
+Notes:
+
+- use `data/lafan1/manifests/g1_lafan1_manifest.json` to load the full local 40-motion set
+- `Isaac-Imitation-G1-v0` is the canonical vanilla tracking task and expects `env.lafan1_manifest_path=...`
+- `Isaac-Imitation-G1-Latent-v0` is the latent-conditioned variant for ASE or latent-enabled IPMD
+- `Isaac-Imitation-G1-LafanTrack-v0` remains available as a legacy alias for the vanilla task
+- `replay_reference.py` disables reward and termination terms by default, so long reference videos do not reset early
+- pass `--keep_terminations` or `--keep_rewards` if you explicitly want the old RL-style behavior during replay
+- `--num_envs 40` is the way to see all 40 loaded trajectories at once; using fewer environments still loads the manifest,
+  but only that many trajectories are visible at a time
 
 ## Development workflow
 
@@ -225,3 +456,63 @@ Note that the current hook set is inherited from upstream Isaac Lab conventions.
 For cluster submission, local Isaac Lab Python installation is not required on the submission machine if jobs run inside
 the provided container or Apptainer image. See `docker/cluster` and [REPO_SETUP.md](REPO_SETUP.md) for the expected sync
 layout and environment variables.
+
+Cluster jobs submitted through `docker/cluster/cluster_interface.sh job ...` now auto-check the G1 dataset tree before
+running the user workload. The container-side preflight in `docker/cluster/run_singularity.sh` verifies that the G1 NPZ
+tree under `${CLUSTER_G1_DATA_ROOT:-${CLUSTER_DATA_DIR}/lafan1}` contains at least 40 motions. If the dataset is
+incomplete, it downloads the G1 NPZ dataset from Hugging Face with `scripts/setup_g1_lafan1_npz_dataset.py` and
+regenerates `g1_lafan1_manifest.json` with `scripts/write_lafan1_npz_manifest.py` only when the manifest is missing or
+older than the NPZ files. You can override that behavior with `CLUSTER_G1_MANIFEST_REFRESH_POLICY`:
+`auto` regenerates only when needed, `never` leaves the manifest untouched, and `always` regenerates on every job.
+
+Submitted jobs also append a default full-dataset override:
+
+```text
+env.lafan1_manifest_path=${CLUSTER_G1_MANIFEST_PATH:-${CLUSTER_G1_DATA_ROOT:-${CLUSTER_DATA_DIR}/lafan1}/manifests/g1_lafan1_manifest.json}
+```
+
+That gives cluster training the 40-motion G1 manifest by default. If you want a different manifest, either set
+`CLUSTER_G1_MANIFEST_PATH` in `docker/cluster/.env.cluster`, disable the behavior with
+`CLUSTER_APPEND_DEFAULT_G1_MANIFEST=0`, or pass `env.lafan1_manifest_path=...` explicitly in the submitted job args.
+
+Relevant cluster env vars:
+
+- `CLUSTER_AUTO_SETUP_G1_DATA=1`: enable the automatic G1 dataset bootstrap before each job (default)
+- `CLUSTER_G1_EXPECTED_MOTION_COUNT=40`: minimum motion count required for the G1 manifest check
+- `CLUSTER_G1_DATA_ROOT=${CLUSTER_DATA_DIR}/lafan1`: override the G1 dataset root checked by the preflight helper
+- `CLUSTER_G1_REPO_ID=GeorgiaTech/g1_lafan1_50hz`: override the Hugging Face dataset repo used for G1 NPZ download
+- `CLUSTER_HF_TOKEN_FILE=/path/to/.hf_token`: recommended way to provide a Hugging Face read token for cluster-side dataset download
+- `CLUSTER_HF_TOKEN=hf_xxx`: inline token override if you do not want to use a token file
+- `CLUSTER_WANDB_API_KEY_FILE=/path/to/.wandb_api_key`: recommended way to provide a W&B API key from the cluster host into the container
+- `CLUSTER_WANDB_API_KEY=...`: inline W&B API key override if you do not want to use a token file
+- `CLUSTER_APPEND_DEFAULT_G1_MANIFEST=1`: append the default full-manifest override to submitted jobs
+- `CLUSTER_G1_MANIFEST_PATH=${CLUSTER_G1_DATA_ROOT}/manifests/g1_lafan1_manifest.json`: override the default full-manifest job argument
+- `CLUSTER_G1_MANIFEST_REFRESH_POLICY=auto`: control whether cluster preflight regenerates the manifest (`never` is the right setting for a Unitree manifest you want to preserve)
+
+For private repos or authenticated Hugging Face access on the cluster, the recommended setup is:
+
+```bash
+printf '%s\n' 'hf_...' > ~/.hf_token
+chmod 600 ~/.hf_token
+```
+
+Then set in `docker/cluster/.env.cluster`:
+
+```bash
+CLUSTER_HF_TOKEN_FILE=/home/<user>/.hf_token
+```
+
+For W&B, the same host-side pattern is recommended:
+
+```bash
+printf '%s\n' 'your_wandb_api_key' > ~/.wandb_api_key
+chmod 600 ~/.wandb_api_key
+```
+
+Then set in `docker/cluster/.env.cluster`:
+
+```bash
+CLUSTER_WANDB_API_KEY_FILE=/home/<user>/.wandb_api_key
+```
+
+The W&B key file is read on the cluster host before `singularity exec`, then injected into the container as `WANDB_API_KEY`.

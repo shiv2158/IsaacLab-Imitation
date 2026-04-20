@@ -9,59 +9,60 @@
 # Currently supports PBS and SLURM
 CLUSTER_JOB_SCHEDULER=SLURM
 # Docker cache dir for Isaac Sim (has to end on docker-isaac-sim)
-# e.g. /cluster/scratch/$USER/docker-isaac-sim
-CLUSTER_ISAAC_SIM_CACHE_DIR=/home/hice1/fwu91/scratch/Research/IsaacLab/docker-isaac-sim
+# e.g. scratch/docker-isaac-sim
+CLUSTER_ISAAC_SIM_CACHE_DIR=scratch/Research/IsaacLab/docker-isaac-sim
 # Isaac Lab directory on the cluster (has to end on isaaclab)
-# e.g. /cluster/home/$USER/isaaclab
-CLUSTER_ISAACLAB_DIR=/home/hice1/fwu91/scratch/Research/IsaacLab/isaaclab
+# e.g. scratch/isaaclab
+CLUSTER_ISAACLAB_DIR=scratch/Research/IsaacLab/isaaclab
 # Cluster login
-CLUSTER_LOGIN=dheddesheimer3@login-ice.pace.gatech.edu
+CLUSTER_LOGIN=ice
 # Cluster scratch directory to store the SIF file
-# e.g. /cluster/scratch/$USER
-CLUSTER_SIF_PATH=/home/hice1/fwu91/scratch/Research/IsaacLab/isaaclabsif
+# e.g. scratch
+CLUSTER_SIF_PATH=scratch/Research/IsaacLab/isaaclabsif
 # Host directory for datasets (must be on a filesystem with sufficient space)
 # This is bind-mounted into the container at /data
-CLUSTER_DATA_DIR=/home/hice1/fwu91/scratch/Research/IsaacLab/data
+CLUSTER_DATA_DIR=scratch/Research/IsaacLab/data
+# Auto-check and bootstrap the full G1 LAFAN1 dataset before each submitted job.
+CLUSTER_AUTO_SETUP_G1_DATA=1
+# Expected number of G1 motions in the full manifest.
+#CLUSTER_G1_EXPECTED_MOTION_COUNT=40
+# Override the full G1 dataset root used by the cluster preflight helper.
+# Defaults to ${CLUSTER_DATA_DIR}/lafan1.
+#CLUSTER_G1_DATA_ROOT=${CLUSTER_DATA_DIR}/lafan1
+# Override the Hugging Face dataset repo used when the cluster auto-downloads G1 NPZ motions.
+#CLUSTER_G1_REPO_ID=GeorgiaTech/g1_lafan1_50hz
+# Optional Hugging Face token for dataset download.
+# Prefer a file on the cluster host over storing the raw token in this file.
+# The token only needs `read` scope for dataset download.
+CLUSTER_HF_TOKEN_FILE=.hf_token
+#CLUSTER_HF_TOKEN=hf_xxx
+# Optional W&B token for training logs.
+# This file path is on the cluster host / compute node, not inside the container.
+# If unset, an existing WANDB_API_KEY environment variable is used if available.
+CLUSTER_WANDB_API_KEY_FILE=.wandb_api_key
+#CLUSTER_WANDB_API_KEY=xxxxxxxx
+# Append the full G1 manifest override to submitted jobs by default.
+# Disable this if you want to manage env.lafan1_manifest_path manually per job.
+#CLUSTER_APPEND_DEFAULT_G1_MANIFEST=1
+# Override the default full G1 manifest path appended to submitted jobs.
+# Defaults to ${CLUSTER_G1_DATA_ROOT}/manifests/g1_lafan1_manifest.json.
+# CLUSTER_G1_MANIFEST_PATH=${CLUSTER_DATA_DIR}/unitree/manifests/g1_unitree_dance102_manifest.json
+# Control whether cluster preflight rewrites CLUSTER_G1_MANIFEST_PATH.
+# auto: regenerate only if missing or stale relative to ${CLUSTER_G1_DATA_ROOT}/npz/g1
+# never: do not touch the manifest; useful for hand-authored or Unitree manifests
+# always: regenerate on every job
+CLUSTER_G1_MANIFEST_REFRESH_POLICY=never
 # Home directory path inside singularity container.
 # This path is backed by ${CLUSTER_ISAAC_SIM_CACHE_DIR}/home on scratch.
-#CLUSTER_CONTAINER_HOME=/home/hice1/dheddesheimer3
+#CLUSTER_CONTAINER_HOME=/home/hice1/fwu91
 # Remove the temporary isaaclab code copy after the job is done
 REMOVE_CODE_COPY_AFTER_JOB=true
 # Remove the temporary apptainer overlay after the job is done
 REMOVE_OVERLAY_AFTER_JOB=true
 # Python executable within Isaac Lab directory to run with the submitted job
-# CLUSTER_PYTHON_EXECUTABLE=scripts/rlopt/train.py
 CLUSTER_PYTHON_EXECUTABLE=scripts/rlopt/train.py
-# SLURM resource controls for docker/cluster/submit_job_slurm.sh
-CLUSTER_SLURM_GPUS_PER_NODE=h100:1
-CLUSTER_SLURM_NODES=1
-CLUSTER_SLURM_MEM_PER_GPU=24G
-CLUSTER_SLURM_TIME=8:00:00
-# CLUSTER_SLURM_CPUS_PER_TASK=4
-# CLUSTER_SLURM_MEM_PER_GPU=16G
-# CLUSTER_SLURM_TIME=2:00:00 # TESTING ONLY!!!!
-# Optional SLURM placement/account controls
-#CLUSTER_SLURM_PARTITION=gpu
-#CLUSTER_SLURM_ACCOUNT=my-allocation
-# Optional SLURM email notifications (set both to enable)
-CLUSTER_SLURM_MAIL_TYPE=BEGIN,END,FAIL
-CLUSTER_SLURM_MAIL_USER=dheddesheimer3@gatech.edu
-# Optional: include log/error tails in a separate custom email from the job script.
-# Values: FAIL (default behavior), END, ALWAYS, or empty to disable.
-CLUSTER_SLURM_EMAIL_LOGS_ON=ALWAYS
-# Number of lines from error_%j.log to include.
-CLUSTER_SLURM_EMAIL_LOG_TAIL_LINES=200
-# PBS resource controls for docker/cluster/submit_job_pbs.sh
-#CLUSTER_PBS_SELECT=1:ncpus=8:mpiprocs=1:ngpus=1
-#CLUSTER_PBS_WALLTIME=24:00:00
-#CLUSTER_PBS_QUEUE=gpu
-#CLUSTER_PBS_JOB_NAME=isaaclab
-# Optional PBS mail settings (both must be set to enable notifications)
-#CLUSTER_PBS_MAIL_EVENTS=bea
-#CLUSTER_PBS_MAIL_USER=user@mail
 # Extra local repositories to sync on each job submission.
 # Format: "<local_abs_path>:<remote_subdir> <local_abs_path>:<remote_subdir>"
-
 # If unset, no extra overlay sync is done and the top-level repo's submodule state is used as-is.
 #CLUSTER_EXTRA_SYNC_SPECS="/path/to/IsaacLab:IsaacLab /path/to/RLOpt:RLOpt /path/to/ImitationLearningTools:ImitationLearningTools"
 # Prefer git clone/fetch checkout at the exact local HEAD commit.
@@ -76,10 +77,6 @@ CLUSTER_SLURM_EMAIL_LOG_TAIL_LINES=200
 # CLUSTER_ISAACLAB_LOCAL_PATH=/home/fwu/Documents/Research/SkillLearning/IsaacLab
 CLUSTER_RLOPT_LOCAL_PATH=/home/fwu91/Documents/Research/SkillLearning/RLOpt
 # CLUSTER_IMITATION_TOOLS_LOCAL_PATH=/home/fwu/Documents/Research/SkillLearning/ImitationLearningTools
-
-# Submodule/worktree overlays. Paths are relative to this repo root (works from WSL + /mnt/c/...).
-# Absolute paths are also supported. Remove any repo you do not have checked out locally.
-CLUSTER_EXTRA_SYNC_SPECS="IsaacLab:IsaacLab RLOpt:RLOpt ImitationLearningTools:ImitationLearningTools unitree_rl_lab:unitree_rl_lab"
 # Extra PYTHONPATH entries inside container, relative to /workspace/isaaclab/project.
 # This should match the remote_subdir values above.
 CLUSTER_EXTRA_PYTHONPATH_REL=IsaacLab/source/isaaclab:IsaacLab/source/isaaclab_tasks:IsaacLab/source/isaaclab_assets:IsaacLab/source/isaaclab_rl:IsaacLab/source/isaaclab_mimic:source/isaaclab_imitation:unitree_rl_lab/source/unitree_rl_lab:RLOpt:ImitationLearningTools

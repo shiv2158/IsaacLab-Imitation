@@ -9,6 +9,8 @@ set -e
 
 # get script directory
 SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" >/dev/null 2>&1 && pwd )"
+# Active cluster name (empty = use defaults: .env.cluster / submit_job_slurm.sh)
+CLUSTER_NAME=""
 # Resolved "<local_path>:<remote_subdir>" sync specs used by the current job submission.
 SYNC_EXTRA_REPO_SPECS=""
 CLUSTER_ISAACLAB_BASE_DIR=""
@@ -16,6 +18,13 @@ CLUSTER_SYNC_LATEST_LINK=""
 CLUSTER_PREVIOUS_SYNC_DIR=""
 REPO_SYNC_HEAD_SHA=""
 REPO_SYNC_ORIGIN_URL=""
+REPO_SYNC_BRANCH=""
+REPO_SYNC_REMOTE_NAME=""
+REPO_SYNC_REMOTE_BRANCH=""
+REPO_SYNC_UPSTREAM_REF=""
+REPO_SYNC_AHEAD_COUNT=""
+REPO_SYNC_BEHIND_COUNT=""
+REPO_SYNC_CAN_FETCH_HEAD=""
 REPO_SYNC_REASON=""
 
 #==
@@ -24,6 +33,30 @@ REPO_SYNC_REASON=""
 # Function to display warnings in red
 display_warning() {
     echo -e "\033[31mWARNING: $1\033[0m"
+}
+
+resolve_local_tmp_dir() {
+    local candidate=""
+
+    for candidate in "${TMPDIR:-}" "/tmp"; do
+        if [ -z "$candidate" ]; then
+            continue
+        fi
+        if mkdir -p "$candidate" >/dev/null 2>&1; then
+            realpath "$candidate" 2>/dev/null || echo "$candidate"
+            return 0
+        fi
+    done
+
+    candidate="$SCRIPT_DIR"
+    if mkdir -p "$candidate" >/dev/null 2>&1; then
+        display_warning "Could not prepare TMPDIR='${TMPDIR:-<unset>}'; using '$candidate' for local temporary files."
+        realpath "$candidate" 2>/dev/null || echo "$candidate"
+        return 0
+    fi
+
+    echo "[ERROR] Failed to resolve a writable local temporary directory." >&2
+    exit 1
 }
 
 normalize_git_remote_to_https() {
@@ -148,9 +181,20 @@ sync_tree_to_cluster() {
 
 prepare_repo_git_sync_metadata() {
     local repo_path="$1"
+    local upstream_ref=""
+    local remote_ref_containing_head=""
+    local remote_head_ref=""
+    local ahead_behind_counts=""
 
     REPO_SYNC_HEAD_SHA=""
     REPO_SYNC_ORIGIN_URL=""
+    REPO_SYNC_BRANCH=""
+    REPO_SYNC_REMOTE_NAME=""
+    REPO_SYNC_REMOTE_BRANCH=""
+    REPO_SYNC_UPSTREAM_REF=""
+    REPO_SYNC_AHEAD_COUNT="0"
+    REPO_SYNC_BEHIND_COUNT="0"
+    REPO_SYNC_CAN_FETCH_HEAD="0"
     REPO_SYNC_REASON="not_git_repo"
 
     if ! git -C "$repo_path" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
@@ -163,12 +207,51 @@ prepare_repo_git_sync_metadata() {
         return 1
     fi
 
-    REPO_SYNC_ORIGIN_URL="$(git -C "$repo_path" remote get-url origin 2>/dev/null || true)"
+    REPO_SYNC_BRANCH="$(git -C "$repo_path" symbolic-ref --quiet --short HEAD 2>/dev/null || true)"
+    upstream_ref="$(git -C "$repo_path" rev-parse --abbrev-ref --symbolic-full-name @{u} 2>/dev/null || true)"
+    if [ -n "$upstream_ref" ] && [ "${upstream_ref#*/}" != "$upstream_ref" ]; then
+        REPO_SYNC_REMOTE_NAME="${upstream_ref%%/*}"
+        REPO_SYNC_REMOTE_BRANCH="${upstream_ref#*/}"
+        REPO_SYNC_UPSTREAM_REF="$upstream_ref"
+    else
+        REPO_SYNC_REMOTE_NAME="origin"
+        remote_ref_containing_head="$(git -C "$repo_path" for-each-ref --format='%(refname:short)' --contains "$REPO_SYNC_HEAD_SHA" "refs/remotes/${REPO_SYNC_REMOTE_NAME}/*" | grep -v '/HEAD$' | head -n 1)"
+        if [ -n "$remote_ref_containing_head" ]; then
+            REPO_SYNC_UPSTREAM_REF="$remote_ref_containing_head"
+            REPO_SYNC_REMOTE_BRANCH="${remote_ref_containing_head#*/}"
+        else
+            remote_head_ref="$(git -C "$repo_path" symbolic-ref --quiet --short "refs/remotes/${REPO_SYNC_REMOTE_NAME}/HEAD" 2>/dev/null || true)"
+            if [ -n "$remote_head_ref" ]; then
+                REPO_SYNC_UPSTREAM_REF="$remote_head_ref"
+                REPO_SYNC_REMOTE_BRANCH="${remote_head_ref#*/}"
+            else
+                REPO_SYNC_REMOTE_BRANCH="$REPO_SYNC_BRANCH"
+            fi
+        fi
+    fi
+
+    REPO_SYNC_ORIGIN_URL="$(git -C "$repo_path" remote get-url "${REPO_SYNC_REMOTE_NAME:-origin}" 2>/dev/null || true)"
+    if [ -z "$REPO_SYNC_ORIGIN_URL" ]; then
+        REPO_SYNC_REMOTE_NAME="origin"
+        REPO_SYNC_REMOTE_BRANCH="${REPO_SYNC_REMOTE_BRANCH:-$REPO_SYNC_BRANCH}"
+        REPO_SYNC_ORIGIN_URL="$(git -C "$repo_path" remote get-url origin 2>/dev/null || true)"
+    fi
     if [ -z "$REPO_SYNC_ORIGIN_URL" ]; then
         REPO_SYNC_REASON="missing_origin_remote"
         return 1
     fi
     REPO_SYNC_ORIGIN_URL="$(normalize_git_remote_to_https "$REPO_SYNC_ORIGIN_URL")"
+
+    if [ -n "$REPO_SYNC_UPSTREAM_REF" ]; then
+        ahead_behind_counts="$(git -C "$repo_path" rev-list --left-right --count "${REPO_SYNC_UPSTREAM_REF}...HEAD" 2>/dev/null || true)"
+        if [ -n "$ahead_behind_counts" ]; then
+            REPO_SYNC_BEHIND_COUNT="$(echo "$ahead_behind_counts" | awk '{print $1}')"
+            REPO_SYNC_AHEAD_COUNT="$(echo "$ahead_behind_counts" | awk '{print $2}')"
+        fi
+        if git -C "$repo_path" merge-base --is-ancestor "$REPO_SYNC_HEAD_SHA" "$REPO_SYNC_UPSTREAM_REF" >/dev/null 2>&1; then
+            REPO_SYNC_CAN_FETCH_HEAD="1"
+        fi
+    fi
 
     REPO_SYNC_REASON="dirty_worktree"
     if [ -n "$(git -C "$repo_path" status --porcelain 2>/dev/null)" ]; then
@@ -184,13 +267,17 @@ sync_repo_from_git_to_cluster() {
     local label="$2"
     local origin_url="$3"
     local head_sha="$4"
+    local branch_name="$5"
+    local remote_branch="$6"
 
-    echo "[INFO] Syncing $label via git checkout: commit='$head_sha' origin='$origin_url'"
-    ssh "$CLUSTER_LOGIN" bash -s -- "$dst_path" "$origin_url" "$head_sha" <<'EOF'
+    echo "[INFO] Syncing $label via git checkout: commit='$head_sha' branch='${branch_name:-detached}' remote_branch='${remote_branch:-N/A}' origin='$origin_url'"
+    ssh "$CLUSTER_LOGIN" bash -s -- "$dst_path" "$origin_url" "$head_sha" "$branch_name" "$remote_branch" <<'EOF'
 set -e
 target_dir="$1"
 origin_url="$2"
 head_sha="$3"
+branch_name="$4"
+remote_branch="$5"
 
 if [ -z "$target_dir" ] || [ "$target_dir" = "/" ]; then
     echo "[ERROR] Invalid target dir for git sync: '$target_dir'" >&2
@@ -219,16 +306,39 @@ if ! git -C "$target_dir" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
     git clone --no-checkout "$origin_url" "$target_dir"
 fi
 
-if ! git -C "$target_dir" fetch --depth 1 origin "$head_sha"; then
-    git -C "$target_dir" fetch origin "$head_sha"
+if [ -n "$remote_branch" ]; then
+    if ! git -C "$target_dir" fetch --depth 1 origin "refs/heads/$remote_branch:refs/remotes/origin/$remote_branch"; then
+        git -C "$target_dir" fetch origin "$remote_branch" || true
+    fi
 fi
-git -C "$target_dir" checkout -f "$head_sha"
+
+if [ -n "$branch_name" ] && [ -n "$remote_branch" ] \
+    && git -C "$target_dir" show-ref --verify --quiet "refs/remotes/origin/$remote_branch"; then
+    git -C "$target_dir" checkout -B "$branch_name" "refs/remotes/origin/$remote_branch"
+elif [ -n "$branch_name" ]; then
+    git -C "$target_dir" checkout -B "$branch_name"
+fi
+
+if [ -n "$head_sha" ]; then
+    if ! git -C "$target_dir" fetch --depth 1 origin "$head_sha"; then
+        git -C "$target_dir" fetch origin "$head_sha"
+    fi
+    if [ -n "$branch_name" ]; then
+        git -C "$target_dir" checkout -B "$branch_name" "$head_sha"
+    else
+        git -C "$target_dir" checkout -f "$head_sha"
+    fi
+fi
+
+git -C "$target_dir" reset --hard >/dev/null 2>&1 || true
+git -C "$target_dir" clean -fdx >/dev/null 2>&1 || true
 
 if [ -f "$target_dir/.gitmodules" ]; then
     git -C "$target_dir" submodule sync --recursive || true
     if ! git -C "$target_dir" submodule update --init --recursive --depth 1; then
         git -C "$target_dir" submodule update --init --recursive
     fi
+    git -C "$target_dir" submodule foreach --recursive 'git reset --hard >/dev/null 2>&1 || true; git clean -fdx >/dev/null 2>&1 || true' >/dev/null 2>&1 || true
 fi
 EOF
 }
@@ -237,11 +347,12 @@ apply_local_git_diff_to_cluster() {
     local src_path="$1"
     local dst_path="$2"
     local label="$3"
+    local base_ref="${4:-HEAD}"
     local has_tracked_changes=0
     local has_untracked_changes=0
     local first_untracked_file=""
 
-    if ! git -C "$src_path" diff --quiet HEAD --; then
+    if ! git -C "$src_path" diff --quiet "$base_ref" --; then
         has_tracked_changes=1
     fi
 
@@ -256,11 +367,11 @@ apply_local_git_diff_to_cluster() {
     fi
 
     if [ "$has_tracked_changes" -eq 1 ]; then
-        echo "[INFO] Applying tracked git diff for '$label' on cluster."
-        git -C "$src_path" diff --binary HEAD -- \
-            | ssh "$CLUSTER_LOGIN" "cd '$dst_path' && git apply --binary --whitespace=nowarn --check"
-        git -C "$src_path" diff --binary HEAD -- \
-            | ssh "$CLUSTER_LOGIN" "cd '$dst_path' && git apply --binary --whitespace=nowarn"
+        echo "[INFO] Applying tracked git delta for '$label' on cluster (base_ref='$base_ref')."
+        git -C "$src_path" diff --binary "$base_ref" -- \
+            | ssh "$CLUSTER_LOGIN" "cd '$dst_path' && git apply --binary --3way --whitespace=nowarn --check"
+        git -C "$src_path" diff --binary "$base_ref" -- \
+            | ssh "$CLUSTER_LOGIN" "cd '$dst_path' && git apply --binary --3way --whitespace=nowarn"
     fi
 
     if [ "$has_untracked_changes" -eq 1 ]; then
@@ -278,23 +389,57 @@ sync_repo_prefer_git_then_rsync() {
     local dst_path="$2"
     local label="$3"
     local remote_subdir="${4:-.}"
+    local ahead_count="${REPO_SYNC_AHEAD_COUNT:-0}"
+    local behind_count="${REPO_SYNC_BEHIND_COUNT:-0}"
 
     if is_truthy "${CLUSTER_GIT_SYNC_FIRST:-1}"; then
         if prepare_repo_git_sync_metadata "$src_path"; then
-            if sync_repo_from_git_to_cluster "$dst_path" "$label" "$REPO_SYNC_ORIGIN_URL" "$REPO_SYNC_HEAD_SHA"; then
-                return
+            ahead_count="${REPO_SYNC_AHEAD_COUNT:-0}"
+            behind_count="${REPO_SYNC_BEHIND_COUNT:-0}"
+
+            if [ "$ahead_count" -gt 0 ] && [ -n "$REPO_SYNC_UPSTREAM_REF" ]; then
+                echo "[INFO] '$label' is ahead of remote base '$REPO_SYNC_UPSTREAM_REF' (ahead=${ahead_count}, behind=${behind_count}); cloning remote branch then applying local revision delta."
+                if sync_repo_from_git_to_cluster "$dst_path" "$label" "$REPO_SYNC_ORIGIN_URL" "" "$REPO_SYNC_BRANCH" "$REPO_SYNC_REMOTE_BRANCH" \
+                    && apply_local_git_diff_to_cluster "$src_path" "$dst_path" "$label" "$REPO_SYNC_UPSTREAM_REF"; then
+                    return
+                fi
+                display_warning "Git branch+delta sync failed for '$label'; falling back to rsync from local workspace."
+            elif [ "${REPO_SYNC_CAN_FETCH_HEAD:-0}" = "1" ]; then
+                if sync_repo_from_git_to_cluster "$dst_path" "$label" "$REPO_SYNC_ORIGIN_URL" "$REPO_SYNC_HEAD_SHA" "$REPO_SYNC_BRANCH" "$REPO_SYNC_REMOTE_BRANCH"; then
+                    return
+                fi
+                display_warning "Git sync failed for '$label'; falling back to rsync from local workspace."
+            elif [ -n "$REPO_SYNC_UPSTREAM_REF" ]; then
+                echo "[INFO] '$label' is using remote base '$REPO_SYNC_UPSTREAM_REF' (ahead=${ahead_count}, behind=${behind_count}); cloning remote branch then applying local revision delta."
+                if sync_repo_from_git_to_cluster "$dst_path" "$label" "$REPO_SYNC_ORIGIN_URL" "" "$REPO_SYNC_BRANCH" "$REPO_SYNC_REMOTE_BRANCH" \
+                    && apply_local_git_diff_to_cluster "$src_path" "$dst_path" "$label" "$REPO_SYNC_UPSTREAM_REF"; then
+                    return
+                fi
+                display_warning "Git branch+delta sync failed for '$label'; falling back to rsync from local workspace."
+            else
+                display_warning "Unable to determine a remote base for '$label'; falling back to rsync from local workspace."
             fi
-            display_warning "Git sync failed for '$label'; falling back to rsync from local workspace."
         else
             case "$REPO_SYNC_REASON" in
                 dirty_worktree)
                     if [ -n "$REPO_SYNC_HEAD_SHA" ] && [ -n "$REPO_SYNC_ORIGIN_URL" ]; then
-                        echo "[INFO] '$label' has local changes; cloning base commit then applying local diff."
-                        if sync_repo_from_git_to_cluster "$dst_path" "$label" "$REPO_SYNC_ORIGIN_URL" "$REPO_SYNC_HEAD_SHA" \
-                            && apply_local_git_diff_to_cluster "$src_path" "$dst_path" "$label"; then
-                            return
+                        if [ "${REPO_SYNC_CAN_FETCH_HEAD:-0}" = "1" ]; then
+                            echo "[INFO] '$label' has local changes but HEAD is reachable from remote; cloning exact commit then applying worktree delta."
+                            if sync_repo_from_git_to_cluster "$dst_path" "$label" "$REPO_SYNC_ORIGIN_URL" "$REPO_SYNC_HEAD_SHA" "$REPO_SYNC_BRANCH" "$REPO_SYNC_REMOTE_BRANCH" \
+                                && apply_local_git_diff_to_cluster "$src_path" "$dst_path" "$label" "HEAD"; then
+                                return
+                            fi
+                            display_warning "Git checkout+worktree apply failed for '$label'; falling back to rsync."
+                        elif [ -n "${REPO_SYNC_UPSTREAM_REF:-}" ]; then
+                            echo "[INFO] '$label' has local changes ahead of remote base '$REPO_SYNC_UPSTREAM_REF'; cloning remote branch then applying the combined local delta."
+                            if sync_repo_from_git_to_cluster "$dst_path" "$label" "$REPO_SYNC_ORIGIN_URL" "" "$REPO_SYNC_BRANCH" "$REPO_SYNC_REMOTE_BRANCH" \
+                                && apply_local_git_diff_to_cluster "$src_path" "$dst_path" "$label" "$REPO_SYNC_UPSTREAM_REF"; then
+                                return
+                            fi
+                            display_warning "Git branch+delta sync failed for '$label'; falling back to rsync."
+                        else
+                            echo "[INFO] '$label' is dirty but no upstream base could be determined; using rsync."
                         fi
-                        display_warning "Git clone+diff apply failed for '$label'; falling back to rsync."
                     else
                         echo "[INFO] '$label' is dirty but missing git metadata; using rsync."
                     fi
@@ -334,6 +479,21 @@ is_truthy() {
             return 1
             ;;
     esac
+}
+
+has_arg_with_prefix() {
+    local prefix="$1"
+    shift
+
+    for arg in "$@"; do
+        case "$arg" in
+            "${prefix}"*)
+                return 0
+                ;;
+        esac
+    done
+
+    return 1
 }
 
 init_incremental_sync_state() {
@@ -489,9 +649,11 @@ record_repo_sync_manifest() {
     local manifest_remote_file
     local local_path
     local remote_subdir
+    local local_tmp_dir
 
     local_workspace_root="$(realpath "$SCRIPT_DIR/../..")"
-    manifest_local_file="$(mktemp "${TMPDIR:-/tmp}/isaaclab_cluster_repo_manifest.XXXXXX")"
+    local_tmp_dir="$(resolve_local_tmp_dir)"
+    manifest_local_file="$(mktemp "${local_tmp_dir}/isaaclab_cluster_repo_manifest.XXXXXX")"
     manifest_remote_file="$CLUSTER_ISAACLAB_DIR/repo_sync_manifest.tsv"
 
     {
@@ -522,15 +684,30 @@ record_repo_sync_manifest() {
 }
 
 submit_job() {
+    local -a job_args=("$@")
+    local default_manifest_path=""
+    local remote_job_cmd=""
 
-    echo "[INFO] Arguments passed to job script ${@}"
+    echo "[INFO] Arguments passed to job script ${job_args[*]}"
 
     case $CLUSTER_JOB_SCHEDULER in
         "SLURM")
-            job_script_file=submit_job_slurm.sh
+            if [ -n "$CLUSTER_NAME" ] && [ -f "$SCRIPT_DIR/submit_job_slurm_${CLUSTER_NAME}.sh" ]; then
+                job_script_file="submit_job_slurm_${CLUSTER_NAME}.sh"
+            elif [ -n "${CLUSTER_LOGIN:-}" ] && [ -f "$SCRIPT_DIR/submit_job_slurm_${CLUSTER_LOGIN}.sh" ]; then
+                job_script_file="submit_job_slurm_${CLUSTER_LOGIN}.sh"
+            else
+                job_script_file=submit_job_slurm.sh
+            fi
             ;;
         "PBS")
-            job_script_file=submit_job_pbs.sh
+            if [ -n "$CLUSTER_NAME" ] && [ -f "$SCRIPT_DIR/submit_job_pbs_${CLUSTER_NAME}.sh" ]; then
+                job_script_file="submit_job_pbs_${CLUSTER_NAME}.sh"
+            elif [ -n "${CLUSTER_LOGIN:-}" ] && [ -f "$SCRIPT_DIR/submit_job_pbs_${CLUSTER_LOGIN}.sh" ]; then
+                job_script_file="submit_job_pbs_${CLUSTER_LOGIN}.sh"
+            else
+                job_script_file=submit_job_pbs.sh
+            fi
             ;;
         *)
             echo "[ERROR] Unsupported job scheduler specified: '$CLUSTER_JOB_SCHEDULER'. Supported options are: ['SLURM', 'PBS']"
@@ -538,7 +715,25 @@ submit_job() {
             ;;
     esac
 
-    ssh $CLUSTER_LOGIN "cd $CLUSTER_ISAACLAB_DIR && bash -l $CLUSTER_ISAACLAB_DIR/docker/cluster/$job_script_file \"$CLUSTER_ISAACLAB_DIR\" \"isaac-lab-$profile\" ${@}"
+    if is_truthy "${CLUSTER_APPEND_DEFAULT_G1_MANIFEST:-1}"; then
+        default_manifest_path="${CLUSTER_G1_MANIFEST_PATH:-${CLUSTER_G1_DATA_ROOT:-${CLUSTER_DATA_DIR}/lafan1}/manifests/g1_lafan1_manifest.json}"
+        if has_arg_with_prefix "env.lafan1_manifest_path=" "${job_args[@]}"; then
+            echo "[INFO] Job already specifies env.lafan1_manifest_path; leaving it unchanged."
+        else
+            job_args+=("env.lafan1_manifest_path=${default_manifest_path}")
+            echo "[INFO] Appended default G1 manifest override: env.lafan1_manifest_path=${default_manifest_path}"
+        fi
+    else
+        echo "[INFO] Default G1 manifest override disabled via CLUSTER_APPEND_DEFAULT_G1_MANIFEST='${CLUSTER_APPEND_DEFAULT_G1_MANIFEST:-0}'."
+    fi
+
+    printf -v remote_job_cmd '%q ' \
+        bash -l "$CLUSTER_ISAACLAB_DIR/docker/cluster/$job_script_file" \
+        "$CLUSTER_ISAACLAB_DIR" \
+        "isaac-lab-$profile" \
+        "${job_args[@]}"
+
+    ssh "$CLUSTER_LOGIN" "cd '$CLUSTER_ISAACLAB_DIR' && ${remote_job_cmd}"
 }
 
 sync_extra_repos() {
@@ -587,9 +782,10 @@ sync_extra_repos() {
 #!/bin/bash
 
 help() {
-    echo -e "\nusage: $(basename "$0") [-h] <command> [<profile>] [<job_args>...] -- Utility for interfacing between IsaacLab and compute clusters."
+    echo -e "\nusage: $(basename "$0") [-h] [-c <cluster>] <command> [<profile>] [<job_args>...] -- Utility for interfacing between IsaacLab and compute clusters."
     echo -e "\noptions:"
     echo -e "  -h              Display this help message."
+    echo -e "  -c <cluster>    Select cluster profile. Sources .env.<cluster> and uses submit_job_slurm_<cluster>.sh if present; falls back to .env.cluster / submit_job_slurm.sh."
     echo -e "\ncommands:"
     echo -e "  push [<profile>]              Push the docker image to the cluster."
     echo -e "  job [<profile>] [<job_args>]  Submit a job to the cluster."
@@ -600,14 +796,22 @@ help() {
 }
 
 # Parse options
-while getopts ":h" opt; do
+while getopts ":hc:" opt; do
     case ${opt} in
         h )
             help
             exit 0
             ;;
+        c )
+            CLUSTER_NAME="$OPTARG"
+            ;;
         \? )
             echo "Invalid option: -$OPTARG" >&2
+            help
+            exit 1
+            ;;
+        : )
+            echo "Option -$OPTARG requires an argument." >&2
             help
             exit 1
             ;;
@@ -646,7 +850,11 @@ case $command in
         # Check docker and apptainer version
         check_docker_version
         # source env file to get cluster login and path information
-        source $SCRIPT_DIR/.env.cluster
+        _env_file="${CLUSTER_NAME:+.env.${CLUSTER_NAME}}"
+        source "$SCRIPT_DIR/${_env_file:-.env.cluster}"
+        # Prepend remote $HOME to relative cluster paths.
+        CLUSTER_REMOTE_HOME=$(ssh "$CLUSTER_LOGIN" 'echo $HOME')
+        CLUSTER_SIF_PATH="$CLUSTER_REMOTE_HOME/$CLUSTER_SIF_PATH"
         # make sure exports directory exists
         mkdir -p /$SCRIPT_DIR/exports
         # clear old exports for selected profile
@@ -676,7 +884,18 @@ case $command in
         echo "[INFO] Executing job command"
         [ -n "$profile" ] && echo -e "\tUsing profile: $profile"
         [ -n "$job_args" ] && echo -e "\tJob arguments: $job_args"
-        source $SCRIPT_DIR/.env.cluster
+        _env_file="${CLUSTER_NAME:+.env.${CLUSTER_NAME}}"
+        source "$SCRIPT_DIR/${_env_file:-.env.cluster}"
+        # Prepend remote $HOME to relative cluster paths.
+        CLUSTER_REMOTE_HOME=$(ssh "$CLUSTER_LOGIN" 'echo $HOME')
+        CLUSTER_ISAAC_SIM_CACHE_DIR="$CLUSTER_REMOTE_HOME/$CLUSTER_ISAAC_SIM_CACHE_DIR"
+        CLUSTER_ISAACLAB_DIR="$CLUSTER_REMOTE_HOME/$CLUSTER_ISAACLAB_DIR"
+        CLUSTER_SIF_PATH="$CLUSTER_REMOTE_HOME/$CLUSTER_SIF_PATH"
+        CLUSTER_DATA_DIR="$CLUSTER_REMOTE_HOME/$CLUSTER_DATA_DIR"
+        CLUSTER_HF_TOKEN_FILE="$CLUSTER_REMOTE_HOME/$CLUSTER_HF_TOKEN_FILE"
+        CLUSTER_WANDB_API_KEY_FILE="$CLUSTER_REMOTE_HOME/$CLUSTER_WANDB_API_KEY_FILE"
+        [ -n "${CLUSTER_G1_MANIFEST_PATH:-}" ] && CLUSTER_G1_MANIFEST_PATH="$CLUSTER_REMOTE_HOME/$CLUSTER_G1_MANIFEST_PATH"
+        [ -n "${CLUSTER_G1_DATA_ROOT:-}" ] && CLUSTER_G1_DATA_ROOT="$CLUSTER_REMOTE_HOME/$CLUSTER_G1_DATA_ROOT"
         CLUSTER_ISAACLAB_BASE_DIR="$CLUSTER_ISAACLAB_DIR"
         # Get current date and time
         current_datetime=$(date +"%Y%m%d_%H%M%S")

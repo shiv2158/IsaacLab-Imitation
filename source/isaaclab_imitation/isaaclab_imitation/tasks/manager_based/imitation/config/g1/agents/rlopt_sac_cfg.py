@@ -1,53 +1,67 @@
-# from isaaclab.utils import configclass
+from isaaclab.utils import configclass
 
-# from isaaclab_imitation.envs.rlopt import PPORLOptConfig
-# from isaaclab_imitation.tasks.manager_based.imitation.config.g1.imitation_g1_env_cfg import (
-#     G1_POLICY_OBS_KEYS,
-#     G1_VALUE_OBS_KEYS,
-# )
+from isaaclab_imitation.envs.rlopt import SACRLOptConfig
 
 
-# @configclass
-# class G1ImitationRLOptSACConfig(PPORLOptConfig):
-#     """RLOpt SAC configuration for G1 imitation."""
+VANILLA_POLICY_INPUT_KEYS: list[tuple[str, str]] = [
+    ("policy", "expert_motion"),
+    ("policy", "expert_anchor_ori_b"),
+    ("policy", "base_ang_vel"),
+    ("policy", "joint_pos_rel"),
+    ("policy", "joint_vel_rel"),
+    ("policy", "last_action"),
+]
 
-#     def __post_init__(self):
-#         super().__post_init__()
+VANILLA_CRITIC_INPUT_KEYS: list[tuple[str, str]] = [
+    ("critic", "expert_motion"),
+    ("critic", "expert_anchor_pos_b"),
+    ("critic", "expert_anchor_ori_b"),
+    ("critic", "body_pos"),
+    ("critic", "body_ori"),
+    ("critic", "base_lin_vel"),
+    ("critic", "base_ang_vel"),
+    ("critic", "joint_pos_rel"),
+    ("critic", "joint_vel_rel"),
+    ("critic", "last_action"),
+]
 
-#         assert isinstance(self, PPORLOptConfig)
-#         assert self.value_function is not None, (
-#             "Value function configuration must be provided."
-#         )
 
-#         self.policy.input_keys = list(G1_POLICY_OBS_KEYS)
-#         self.value_function.input_keys = list(G1_VALUE_OBS_KEYS)
+@configclass
+class G1ImitationRLOptSACConfig(SACRLOptConfig):
+    """RLOpt SAC configuration for vanilla G1 imitation."""
 
-#         self.collector.init_random_frames = 0
-#         self.collector.frames_per_batch = 24
-#         self.replay_buffer.size = 4096 * 24
+    def __post_init__(self):
+        super().__post_init__()
 
-#         self.loss.epochs = 1
-#         self.loss.mini_batch_size = 4096 * 24 // 4
-#         self.loss.loss_critic_type = "l2"
+        assert self.q_function is not None, "Q function configuration must be provided."
 
-#         self.ppo.clip_epsilon = 0.2
-#         self.ppo.gae_lambda = 0.95
-#         self.ppo.entropy_coeff = 0.005
-#         self.ppo.critic_coeff = 1.0
-#         self.ppo.clip_value = True
-#         self.ppo.normalize_advantage = True
-#         self.ppo.clip_log_std = False
-#         self.ppo.log_std_init = 0.0
+        self.policy.input_keys = list(VANILLA_POLICY_INPUT_KEYS)
+        self.q_function.input_keys = list(VANILLA_CRITIC_INPUT_KEYS)
+        self.value_function = None
+        self.collector.frames_per_batch = 12
+        self.collector.total_frames = 100_000_000
+        self.replay_buffer.size = 100_000
+        self.loss.epochs = 1
+        self.loss.mini_batch_size = 4_096 * 4
+        self.collector.init_random_frames = 0
+        self.loss.gamma = 0.99
+        self.policy.num_cells = [512, 256, 128]
+        self.q_function.num_cells = [512, 256, 128]
+        self.sac.alpha_init = 1.0
+        self.sac.min_alpha = 0.001
+        self.sac.target_entropy = "auto"
+        self.sac.num_qvalue_nets = 2
+        self.sac.clip_log_std = True
+        self.sac.log_std_min = -5.0
+        self.sac.log_std_max = 2.0
+        self.optim.target_update_polyak = 0.995
+        self.optim.lr = 3.0e-4
+        self.optim.weight_decay = 0.0
+        self.save_interval = 5_000_000   # samples
+        self.trainer.progress_bar = True
+        self.trainer.log_interval = 10_000_000  # samples
+        self.compile.compile = False
+        self.collector.no_cuda_sync = True
+        self.sac.utd_ratio = 0.3
 
-#         self.optim.lr = 1.0e-3
-#         self.optim.max_grad_norm = 1.0
-#         self.optim.scheduler = "adaptive"
-#         self.optim.desired_kl = 0.01
-
-#         self.loss.gamma = 0.99
-
-#         self.policy.num_cells = [512, 256, 128]
-#         self.value_function.num_cells = [512, 256, 128]
-
-#         self.collector.total_frames = 30000 * 4096 * 24
-#         self.save_interval = 500
+        self.logger.project_name = "G1-Imitation-RLOpt-SAC"

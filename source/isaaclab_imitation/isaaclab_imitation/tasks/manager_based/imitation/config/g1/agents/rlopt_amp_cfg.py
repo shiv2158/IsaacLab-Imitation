@@ -2,11 +2,37 @@ from isaaclab.utils import configclass
 
 from rlopt.agent import AMPRLOptConfig
 
-from isaaclab_imitation.tasks.manager_based.imitation.config.g1.imitation_g1_env_cfg import (
-    G1_POLICY_OBS_KEYS,
-    G1_REWARD_OBS_KEYS,
-    G1_VALUE_OBS_KEYS,
-)
+
+VANILLA_POLICY_INPUT_KEYS: list[tuple[str, str]] = [
+    ("policy", "expert_motion"),
+    ("policy", "expert_anchor_ori_b"),
+    ("policy", "base_ang_vel"),
+    ("policy", "joint_pos_rel"),
+    ("policy", "joint_vel_rel"),
+    ("policy", "last_action"),
+]
+
+VANILLA_CRITIC_INPUT_KEYS: list[tuple[str, str]] = [
+    ("critic", "expert_motion"),
+    ("critic", "expert_anchor_pos_b"),
+    ("critic", "expert_anchor_ori_b"),
+    ("critic", "body_pos"),
+    ("critic", "body_ori"),
+    ("critic", "base_lin_vel"),
+    ("critic", "base_ang_vel"),
+    ("critic", "joint_pos_rel"),
+    ("critic", "joint_vel_rel"),
+    ("critic", "last_action"),
+]
+
+EXPERT_INPUT_KEYS: list[tuple[str, str]] = [
+    ("expert_state", "joint_pos"),
+    ("expert_state", "joint_vel"),
+    ("expert_state", "root_pos"),
+    ("expert_state", "root_quat"),
+    ("expert_state", "root_lin_vel"),
+    ("expert_state", "root_ang_vel"),
+]
 
 
 @configclass
@@ -21,9 +47,9 @@ class G1ImitationRLOptAMPConfig(AMPRLOptConfig):
             "Value function configuration must be provided."
         )
 
-        self.policy.input_keys = list(G1_POLICY_OBS_KEYS)
-        self.value_function.input_keys = list(G1_VALUE_OBS_KEYS)
-        self.gail.discriminator_input_keys = list(G1_REWARD_OBS_KEYS)
+        self.policy.input_keys = list(VANILLA_POLICY_INPUT_KEYS)
+        self.value_function.input_keys = list(VANILLA_CRITIC_INPUT_KEYS)
+        self.gail.discriminator_input_keys = list(EXPERT_INPUT_KEYS)
 
         self.collector.init_random_frames = 0
         self.collector.frames_per_batch = 24
@@ -53,7 +79,7 @@ class G1ImitationRLOptAMPConfig(AMPRLOptConfig):
         self.value_function.num_cells = [512, 256, 128]
 
         self.collector.total_frames = 30000 * 4096 * 24
-        self.save_interval = 500
+        self.save_interval = 5_000_000   # samples
 
         self.gail.expert_batch_size = int(self.loss.mini_batch_size)
         self.gail.discriminator_updates_per_policy_update = 2
@@ -84,3 +110,6 @@ class G1ImitationRLOptAMPConfig(AMPRLOptConfig):
         self.gail.reward_mix_alpha_when_unstable = 0.2
         self.gail.reward_mix_gate_abs_gap_max = 0.75
         self.gail.reward_mix_alpha_when_gap_large = 0.25
+
+        self.trainer.progress_bar = True
+        self.trainer.log_interval = 10_000_000  # samples

@@ -1,14 +1,12 @@
-# Feiyang Wu (feiyangwu@gatech.edu), based on sb3/trian.py
-
-"""Script to train RL agent with Stable Baselines3."""
-
-"""Launch Isaac Sim Simulator first."""
-
+# Feiyang Wu (feiyangwu@gatech.edu)
+# ruff: noqa: E402
 import argparse
 import logging
 import os
+import re
 import signal
 import sys
+import warnings
 from pathlib import Path
 
 # Isaac Sim's kit Python ships a stale `rlopt` in site-packages that can shadow the
@@ -67,7 +65,10 @@ parser.add_argument(
     "--seed", type=int, default=None, help="Seed used for the environment"
 )
 parser.add_argument(
-    "--log_interval", type=int, default=100_000, help="Log data every n timesteps."
+    "--log_interval",
+    type=int,
+    default=None,
+    help="Override metric logging cadence in environment steps.",
 )
 parser.add_argument(
     "--checkpoint",
@@ -96,6 +97,8 @@ parser.add_argument(
         "FASTSAC",
         "IPMD",
         "IPMD_FASTSAC",
+        "IPMD_SR",
+        "IPMD_BILINEAR",
         "GAIL",
         "AMP",
         "ASE",
@@ -160,24 +163,26 @@ app_launcher = AppLauncher(args_cli)
 simulation_app = app_launcher.app
 
 
-def cleanup_pbar(*args):
-    """
-    A small helper to stop training and
-    cleanup progress bar properly on ctrl+c
-    """
-    import gc
+_sigint_seen = False
 
-    tqdm_objects = [obj for obj in gc.get_objects() if "tqdm" in type(obj).__name__]
-    for tqdm_object in tqdm_objects:
-        if "tqdm_rich" in type(tqdm_object).__name__:
-            tqdm_object.close()
+
+def cleanup_pbar(_signum, _frame):
+    """Handle Ctrl+C quickly and safely.
+
+    Keep the handler minimal to avoid exceptions inside unrelated callback
+    contexts (e.g. Isaac Sim GC hooks) and ensure first Ctrl+C stops training.
+    """
+    global _sigint_seen
+    if not _sigint_seen:
+        _sigint_seen = True
+        print("\n[INFO] Ctrl+C received. Stopping training...")
+        # Restore default behavior for any subsequent interrupt during shutdown.
+        signal.signal(signal.SIGINT, signal.default_int_handler)
     raise KeyboardInterrupt
 
 
 # disable KeyboardInterrupt override
 signal.signal(signal.SIGINT, cleanup_pbar)
-
-"""Rest everything follows."""
 
 import random
 import time
@@ -187,6 +192,7 @@ import gymnasium as gym
 import isaaclab_imitation.tasks  # noqa: F401
 import isaaclab_tasks  # noqa: F401
 import numpy as np
+import wandb
 from isaaclab.envs import (
     DirectMARLEnv,
     DirectMARLEnvCfg,
@@ -197,22 +203,35 @@ from isaaclab.utils.dict import print_dict
 from isaaclab.utils.io import dump_yaml
 from isaaclab_imitation.envs.rlopt import IsaacLabTerminalObsReader, IsaacLabWrapper
 from isaaclab_tasks.utils.hydra import hydra_task_config
-from rlopt.agent import AMP, ASE, GAIL, IPMD, PPO, SAC, FastSAC
+from rlopt.agent import AMP, ASE, GAIL, IPMD, IPMDFastSAC, IPMDBilinear, IPMDSR, PPO, SAC, FastSAC
 from rlopt.config_base import RLOptConfig, TrainerConfig
 from torchrl.envs import (
     Compose,
-    ExcludeTransform,
     RewardSum,
     StepCounter,
     TransformedEnv,
+    RewardClipping,
 )
-from torchrl.record import PixelRenderTransform, VideoRecorder
-from torchrl.record.loggers.csv import CSVLogger
 
 torch.set_float32_matmul_precision("high")
 
+# Suppress known third-party deprecations until upstream packages update.
+warnings.filterwarnings(
+    "ignore",
+    message=r"Read the `app_url` setting from the appropriate Settings object\.",
+    category=DeprecationWarning,
+    module=r"wandb\.analytics\.sentry",
+)
+warnings.filterwarnings(
+    "ignore",
+    message=r"The `Scope\.user` setter is deprecated in favor of `Scope\.set_user\(\)`\.",
+    category=DeprecationWarning,
+    module=r"wandb\.analytics\.sentry",
+)
+
 # import logger
 logger = logging.getLogger(__name__)
+logging.getLogger("iltools").setLevel(logging.WARNING)
 
 WANDB_BACKEND = "wandb"
 WANDB_PROJECT = "FastSAC"
@@ -224,10 +243,26 @@ ALGORITHM_CLASS_MAP = {
     "SAC": SAC,
     "FASTSAC": FastSAC,
     "IPMD": IPMD,
-    "IPMD_FASTSAC": IPMD,
+    "IPMD_FASTSAC": IPMDFastSAC,
+    "IPMD_SR": IPMDSR,
+    "IPMD_BILINEAR": IPMDBilinear,
+    "IPMD_FASTSAC": IPMDFastSAC,
     "GAIL": GAIL,
     "AMP": AMP,
     "ASE": ASE,
+}
+
+ENTRY_POINT_ALGORITHM_MAP = {
+    "rlopt_ppo_cfg_entry_point": "PPO",
+    "rlopt_sac_cfg_entry_point": "SAC",
+    "rlopt_fastsac_cfg_entry_point": "FASTSAC",
+    "rlopt_ipmd_cfg_entry_point": "IPMD",
+    "rlopt_ipmd_sr_cfg_entry_point": "IPMD_SR",
+    "rlopt_ipmd_bilinear_cfg_entry_point": "IPMD_BILINEAR",
+    "rlopt_gail_cfg_entry_point": "GAIL",
+    "rlopt_ipmd_fastsac_cfg_entry_point": "IPMD_FASTSAC",
+    "rlopt_amp_cfg_entry_point": "AMP",
+    "rlopt_ase_cfg_entry_point": "ASE",
 }
 
 
@@ -285,6 +320,113 @@ def _infer_render_fps(env: object, default_fps: int = 30) -> int:
     return max(1, int(default_fps))
 
 
+def _enable_wandb_video_sync(
+    agent: object, *, video_folder: str, base_dir: str, period_samples: int
+):
+    """Enable WandB video sync and return a callable that logs newly completed videos."""
+    logger_obj = getattr(agent, "logger", None)
+    wandb_run = getattr(logger_obj, "experiment", None) if logger_obj else None
+    if (
+        wandb_run is None
+        or not hasattr(wandb_run, "save")
+        or not hasattr(wandb_run, "log")
+    ):
+        print("[INFO] WandB run not available; videos will remain local only.")
+        return None
+
+    video_pattern = os.path.join(video_folder, "*.mp4")
+    video_step_pattern = re.compile(r"step-(\d+)")
+    video_dir = Path(video_folder)
+    last_uploaded_name: str | None = None
+    next_video_step = 0
+
+    def _video_sort_key(path: Path) -> tuple[int, str]:
+        match = video_step_pattern.search(path.stem)
+        if match is not None:
+            return int(match.group(1)), path.name
+        return int(1e12), path.name
+
+    if video_dir.exists():
+        existing_videos = sorted(video_dir.glob("*.mp4"), key=_video_sort_key)
+        if len(existing_videos) > 0:
+            # Start from files created after the latest file seen at startup.
+            last_uploaded_name = existing_videos[-1].name
+            if period_samples > 0:
+                next_video_step = len(existing_videos) * period_samples
+
+    def _log_pending_videos(step_hint: int | None = None) -> None:
+        nonlocal last_uploaded_name
+        nonlocal next_video_step
+
+        if not video_dir.exists():
+            return
+
+        all_videos = sorted(video_dir.glob("*.mp4"), key=_video_sort_key)
+        if len(all_videos) == 0:
+            return
+
+        if last_uploaded_name is None:
+            new_videos = all_videos
+        else:
+            last_idx = next(
+                (i for i, p in enumerate(all_videos) if p.name == last_uploaded_name),
+                None,
+            )
+            if last_idx is None:
+                new_videos = all_videos
+            else:
+                new_videos = all_videos[last_idx + 1 :]
+
+        if len(new_videos) == 0:
+            return
+
+        uploads_this_call = 0
+        for video_path in new_videos:
+            try:
+                if video_path.stat().st_size <= 0:
+                    continue
+            except OSError:
+                continue
+
+            if period_samples > 0:
+                if step_hint is not None:
+                    next_video_step = max(next_video_step, int(step_hint))
+                video_step = int(next_video_step)
+            elif step_hint is not None:
+                video_step = int(step_hint)
+            else:
+                video_step = 0
+
+            try:
+                wandb_run.log(
+                    {
+                        "videos/train": wandb.Video(
+                            str(video_path),
+                            format="mp4",
+                        )
+                    },
+                    step=video_step,
+                )
+                uploads_this_call += 1
+                last_uploaded_name = video_path.name
+                if period_samples > 0:
+                    next_video_step += period_samples
+            except Exception:
+                # If a file is still being finalized, retry on the next periodic call.
+                continue
+
+            if uploads_this_call >= 2:
+                # Bound upload overhead per metrics call.
+                break
+
+    try:
+        # Keep local logging layout and stream only generated videos to WandB.
+        wandb_run.save(video_pattern, base_path=base_dir, policy="live")
+    except Exception as exc:
+        print(f"[WARNING] Failed to enable WandB video sync: {exc}")
+    return _log_pending_videos
+
+
 def resolve_agent_cfg_entry_point(
     task_name: str | None, agent_entry_point: str, algorithm: str
 ) -> str:
@@ -296,20 +438,24 @@ def resolve_agent_cfg_entry_point(
     try:
         spec = gym.spec(task_id)
     except Exception as exc:
-        logger.warning("Could not resolve task '%s' from registry: %s", task_id, exc)
-        return agent_entry_point
+        msg = f"Could not resolve task '{task_id}' from registry."
+        raise ValueError(msg) from exc
+
     if spec.kwargs.get(algo_entry_point) is not None:
-        if algo_entry_point != agent_entry_point:
-            print(f"[INFO] Using agent config entry point: {algo_entry_point}")
+        print(f"[INFO] Using agent config entry point: {algo_entry_point}")
         return algo_entry_point
-    if algorithm != "PPO":
-        logger.warning(
-            "No algorithm-specific agent config for '%s' (expected '%s'); using '%s'.",
-            task_id,
-            algo_entry_point,
-            agent_entry_point,
-        )
-    return agent_entry_point
+
+    supported_algorithms = sorted(
+        ENTRY_POINT_ALGORITHM_MAP[key]
+        for key in ENTRY_POINT_ALGORITHM_MAP
+        if spec.kwargs.get(key) is not None
+    )
+    msg = (
+        "Unsupported task/algo combination: "
+        f"task '{task_id}' does not expose an RLOpt config for '{algorithm}'. "
+        f"Supported RLOpt algorithms for this task: {supported_algorithms}."
+    )
+    raise ValueError(msg)
 
 
 args_cli.agent = resolve_agent_cfg_entry_point(
@@ -348,6 +494,10 @@ def main(
     agent_cfg: RLOptConfig,
 ):
     """Train with stable-baselines agent."""
+    sync_input_keys = getattr(agent_cfg, "sync_input_keys", None)
+    if callable(sync_input_keys):
+        sync_input_keys()
+
     # randomly sample a seed if seed = -1
     if args_cli.seed == -1:
         args_cli.seed = random.randint(0, 10000)
@@ -361,13 +511,14 @@ def main(
     agent_cfg.seed = args_cli.seed if args_cli.seed is not None else agent_cfg.seed
     if agent_cfg.trainer is None:
         agent_cfg.trainer = TrainerConfig()
-    agent_cfg.trainer.log_interval = max(1, int(args_cli.log_interval))
-    # max iterations for training
+    if args_cli.log_interval is not None:
+        agent_cfg.trainer.log_interval = max(1, int(args_cli.log_interval))
+    agent_cfg.collector.frames_per_batch *= env_cfg.scene.num_envs
+    # max_iterations is expressed in rollout iterations, so override total_frames
+    # after scaling frames_per_batch to the actual number of simulated envs.
     if args_cli.max_iterations is not None:
         agent_cfg.collector.total_frames = (
-            args_cli.max_iterations
-            * agent_cfg.collector.total_frames
-            * env_cfg.scene.num_envs
+            args_cli.max_iterations * agent_cfg.collector.frames_per_batch
         )
     agent_cfg.collector.frames_per_batch *= env_cfg.scene.num_envs
     # Convert warmup_collects → init_random_frames now that frames_per_batch is finalized.
@@ -378,6 +529,23 @@ def main(
             agent_cfg.collector.warmup_collects * agent_cfg.collector.frames_per_batch
         )
     apply_rlopt_cli_hyperparams(agent_cfg, args_cli)
+    # TorchRL collectors warn and over-collect when total_frames is not divisible by
+    # frames_per_batch. Align to an exact number of rollout batches.
+    frames_per_batch = int(agent_cfg.collector.frames_per_batch)
+    total_frames = int(agent_cfg.collector.total_frames)
+    if frames_per_batch > 0:
+        aligned_total_frames = max(
+            frames_per_batch,
+            (total_frames // frames_per_batch) * frames_per_batch,
+        )
+        if aligned_total_frames != total_frames:
+            logger.warning(
+                "Adjusting collector.total_frames from %d to %d to match frames_per_batch=%d.",
+                total_frames,
+                aligned_total_frames,
+                frames_per_batch,
+            )
+            agent_cfg.collector.total_frames = aligned_total_frames
     # set the environment seed
     # note: certain randomizations occur in the environment initialization so we set the seed here
     env_cfg.seed = agent_cfg.seed
@@ -430,8 +598,9 @@ def main(
         )
     # wrap for video recording
     if args_cli.video:
+        video_folder = os.path.join(log_dir, "videos", "train")
         video_kwargs = {
-            "video_folder": os.path.join(log_dir, "videos", "train"),
+            "video_folder": video_folder,
             "step_trigger": lambda step: step % args_cli.video_interval == 0,
             "video_length": args_cli.video_length,
             "disable_logger": True,
@@ -454,10 +623,11 @@ def main(
     # the policy obs group and update policy.input_keys=["policy"], or (b) apply separate
     # ObservationNorm per nested key. Deferred to avoid a runtime crash.
     env = TransformedEnv(
-        env=env,
+        base_env=env,
         transform=Compose(
             RewardSum(),  # type: ignore
             StepCounter(1000),  # type: ignore
+            RewardClipping(-10.0, 5.0),  # type: ignore
         ),
     )
 
@@ -467,20 +637,60 @@ def main(
         config=agent_cfg,  # type: ignore
     )
 
-    # run training
-    agent.train()
+    video_media_logger = None
+    if args_cli.video:
+        video_media_logger = _enable_wandb_video_sync(
+            agent,
+            video_folder=video_folder,
+            base_dir=log_dir,
+            period_samples=int(args_cli.video_interval) * int(env_cfg.scene.num_envs),
+        )
+        if video_media_logger is not None:
+            original_log_metrics = agent.log_metrics
 
-    # close the simulator
-    env.close()
+            def _log_metrics_with_video(*args, **kwargs):
+                step = kwargs.get("step")
+                try:
+                    step_hint = int(step) if step is not None else None
+                except Exception:
+                    step_hint = None
+                video_media_logger(step_hint)
+                return original_log_metrics(*args, **kwargs)
+
+            agent.log_metrics = _log_metrics_with_video
+
+    if args_cli.checkpoint is not None:
+        checkpoint_path = os.path.abspath(args_cli.checkpoint)
+        print(f"[INFO] Loading checkpoint: {checkpoint_path}")
+        checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+        if isinstance(checkpoint, dict) and "actor_critic" in checkpoint:
+            agent.load(checkpoint_path)
+        else:
+            print(
+                "[WARNING] Checkpoint does not include full ASE/GAIL state; "
+                "loading policy/value optimizer state only."
+            )
+            agent.load_model(checkpoint_path)
+
+    # run training
+    try:
+        agent.train()
+    except KeyboardInterrupt:
+        print("\n[INFO] Training interrupted by user.")
+    finally:
+        if video_media_logger is not None:
+            video_media_logger(None)
+        env.close()
 
     print(f"Training time: {round(time.time() - start_time, 2)} seconds")
 
-    # close the simulator
-    env.close()
-
 
 if __name__ == "__main__":
-    # run the main function
-    main()
-    # close sim app
-    simulation_app.close()  # type: ignore
+    try:
+        # run the main function
+        main()
+    except (KeyboardInterrupt, SystemExit):
+        pass
+    finally:
+        # close sim app
+        simulation_app.close()  # type: ignore

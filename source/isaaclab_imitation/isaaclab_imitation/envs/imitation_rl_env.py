@@ -77,6 +77,18 @@ class ImitationRLEnv(ManagerBasedRLEnv):
         reference_joint_names = ['left_hip_pitch_joint', ...]
     """
 
+    @staticmethod
+    def _lafan_source_entries_from_loader_kwargs(
+        loader_kwargs: Any,
+    ) -> list[dict[str, Any]]:
+        try:
+            entries = loader_kwargs["dataset"]["trajectories"]["lafan1_csv"]
+        except Exception:
+            return []
+        if not isinstance(entries, list):
+            return []
+        return [entry for entry in entries if isinstance(entry, dict)]
+
     def __init__(self, cfg: Any, render_mode: str | None = None, **kwargs: Any) -> None:
         """Initialize the simplified ImitationRLEnv."""
         # Get device
@@ -88,6 +100,25 @@ class ImitationRLEnv(ManagerBasedRLEnv):
         loader_type = getattr(cfg, "loader_type", None)
         loader_kwargs = getattr(cfg, "loader_kwargs", {})
         refresh_zarr_dataset = bool(getattr(cfg, "refresh_zarr_dataset", False))
+        if loader_type in ("lafan1_csv", "lafan1"):
+            lafan_source_entries = self._lafan_source_entries_from_loader_kwargs(
+                loader_kwargs
+            )
+            manifest_path = getattr(cfg, "lafan1_manifest_path", None)
+            has_manifest_loader = (
+                manifest_path is not None and len(lafan_source_entries) > 0
+            )
+            has_explicit_loader_setup = (
+                dataset_path is not None and len(lafan_source_entries) > 0
+            )
+            if not has_manifest_loader and not has_explicit_loader_setup:
+                raise ValueError(
+                    "G1 LAFAN tracking tasks now require "
+                    "`env.lafan1_manifest_path=/path/to/manifest.json` for normal use. "
+                    "If you are configuring the env programmatically, provide explicit "
+                    "`loader_kwargs.dataset.trajectories.lafan1_csv` entries and "
+                    "`dataset_path` before env creation."
+                )
 
         # Build or load the replay buffer and trajectory info
         if dataset_path is not None:
@@ -184,6 +215,20 @@ class ImitationRLEnv(ManagerBasedRLEnv):
         reference_start_frame = int(getattr(cfg, "reference_start_frame", 0))
         if reference_start_frame < 0:
             raise ValueError("reference_start_frame must be >= 0.")
+        self._latent_patch_past_steps = int(getattr(cfg, "latent_patch_past_steps", 0))
+        self._latent_patch_future_steps = int(
+            getattr(cfg, "latent_patch_future_steps", 0)
+        )
+        if self._latent_patch_past_steps < 0 or self._latent_patch_future_steps < 0:
+            raise ValueError("latent patch window steps must be >= 0.")
+        self._random_reset_step_min = int(getattr(cfg, "random_reset_step_min", 0))
+        self._random_reset_step_max = int(getattr(cfg, "random_reset_step_max", 0))
+        if self._random_reset_step_min < 0:
+            raise ValueError("random_reset_step_min must be >= 0.")
+        if self._random_reset_step_max < self._random_reset_step_min:
+            raise ValueError(
+                "random_reset_step_max must be >= random_reset_step_min."
+            )
         reference_joint_names = list(getattr(cfg, "reference_joint_names", []))
         target_joint_names = list(getattr(cfg, "target_joint_names", []))
         dataset_joint_names = self._read_reference_joint_names_from_zarr(zarr_path)
@@ -217,7 +262,10 @@ class ImitationRLEnv(ManagerBasedRLEnv):
         self._reconstructed_reference_action_mode = str(
             getattr(cfg, "reconstructed_reference_action_mode", "next_pose")
         )
-        if self._reconstructed_reference_action_enabled and not self._reference_has_aligned_next:
+        if (
+            self._reconstructed_reference_action_enabled
+            and not self._reference_has_aligned_next
+        ):
             raise ValueError(
                 "reconstructed_reference_action=True requires transition-aligned next_* reference data. "
                 "Rebuild the cached dataset with `refresh_zarr_dataset=True`."
@@ -237,8 +285,14 @@ class ImitationRLEnv(ManagerBasedRLEnv):
         )
 
         # Get initial reference data (this also initializes env assignments)
-        self.current_reference: TensorDict = self.trajectory_manager.sample(
+        self.current_expert_frame: TensorDict = self.trajectory_manager.sample(
             advance=False
+        )
+        self._agent_latent_dim = int(getattr(cfg, "latent_command_dim", 16))
+        self._agent_latent_command = torch.zeros(
+            (num_envs, self._agent_latent_dim),
+            device=device,
+            dtype=torch.float32,
         )
 
         # Store reference joint mapping
@@ -274,12 +328,8 @@ class ImitationRLEnv(ManagerBasedRLEnv):
         self._expert_sampler_warned_action_fallback = False
         self._expert_sampler_warned_unknown_terms: set[str] = set()
         self._reconstructed_reference_action_term: JointPositionAction | None = None
-        self._reconstructed_reference_target_to_action_index: (
-            torch.Tensor | None
-        ) = None
-        self._reconstructed_reference_action_pd_ratio_target: (
-            torch.Tensor | None
-        ) = None
+        self._reconstructed_reference_target_to_action_index: torch.Tensor | None = None
+        self._reconstructed_reference_action_pd_ratio_target: torch.Tensor | None = None
 
         # Store initial poses for replay
         self._init_root_pos = torch.zeros((num_envs, 3), device=device)
@@ -290,8 +340,8 @@ class ImitationRLEnv(ManagerBasedRLEnv):
         self._reference_reset_root_pos = torch.zeros((num_envs, 3), device=device)
         self._reference_reset_root_quat = torch.zeros((num_envs, 4), device=device)
         self._reference_reset_root_quat[:, 0] = 1.0
-        initial_reference_root_pos = self.current_reference.get("root_pos")
-        initial_reference_root_quat = self.current_reference.get("root_quat")
+        initial_reference_root_pos = self.current_expert_frame.get("root_pos")
+        initial_reference_root_quat = self.current_expert_frame.get("root_quat")
         if initial_reference_root_pos is not None:
             self._reference_reset_root_pos.copy_(initial_reference_root_pos)
         if initial_reference_root_quat is not None:
@@ -302,6 +352,9 @@ class ImitationRLEnv(ManagerBasedRLEnv):
         super().__init__(cfg, render_mode, **kwargs)
 
         self.robot: Articulation = self.scene["robot"]
+        self._expert_env_origins = self.scene.env_origins.clone()
+        self._expert_default_joint_pos = self.robot.data.default_joint_pos.clone()
+        self._expert_default_joint_vel = self.robot.data.default_joint_vel.clone()
         self._setup_reconstructed_reference_action_cache()
         self._finalize_reference_body_names()
         self._initialize_mdp_fast_paths()
@@ -390,8 +443,14 @@ class ImitationRLEnv(ManagerBasedRLEnv):
         if mode == "pd_compensated":
             if kp_target is None or kd_target is None:
                 raise ValueError("pd_compensated reconstruction requires Kp and Kd.")
-            safe_kp = torch.where(kp_target.abs() > 1.0e-8, kp_target, torch.ones_like(kp_target))
-            ratio = torch.where(kp_target.abs() > 1.0e-8, kd_target / safe_kp, torch.zeros_like(kd_target))
+            safe_kp = torch.where(
+                kp_target.abs() > 1.0e-8, kp_target, torch.ones_like(kp_target)
+            )
+            ratio = torch.where(
+                kp_target.abs() > 1.0e-8,
+                kd_target / safe_kp,
+                torch.zeros_like(kd_target),
+            )
         elif mode != "next_pose":
             raise ValueError(
                 "Unsupported reconstructed_reference_action_mode: "
@@ -447,7 +506,9 @@ class ImitationRLEnv(ManagerBasedRLEnv):
             return
 
         target_joint_names = list(self.trajectory_manager.target_joint_names)
-        target_name_to_index = {name: idx for idx, name in enumerate(target_joint_names)}
+        target_name_to_index = {
+            name: idx for idx, name in enumerate(target_joint_names)
+        }
         action_joint_names = list(action_term._joint_names)
         missing_joint_names = [
             name for name in action_joint_names if name not in target_name_to_index
@@ -458,7 +519,9 @@ class ImitationRLEnv(ManagerBasedRLEnv):
                 f"{missing_joint_names}"
             )
 
-        target_joint_ids, _ = self.robot.find_joints(target_joint_names, preserve_order=True)
+        target_joint_ids, _ = self.robot.find_joints(
+            target_joint_names, preserve_order=True
+        )
         kp_target = None
         kd_target = None
         if self._reconstructed_reference_action_mode == "pd_compensated":
@@ -522,7 +585,9 @@ class ImitationRLEnv(ManagerBasedRLEnv):
         if action_term is None:
             action_term = self._reconstructed_reference_action_term
         if action_term is None:
-            raise ValueError("JointPositionAction term is unavailable for action processing.")
+            raise ValueError(
+                "JointPositionAction term is unavailable for action processing."
+            )
 
         raw_action = raw_action.to(device=self.device, dtype=torch.float32)
         env_ids = env_ids.to(device=self.device, dtype=torch.int64)
@@ -553,7 +618,9 @@ class ImitationRLEnv(ManagerBasedRLEnv):
         if action_term is None:
             action_term = self._reconstructed_reference_action_term
         if action_term is None:
-            raise ValueError("JointPositionAction term is unavailable for action processing.")
+            raise ValueError(
+                "JointPositionAction term is unavailable for action processing."
+            )
 
         processed_action = processed_action.to(device=self.device, dtype=torch.float32)
         env_ids = env_ids.to(device=self.device, dtype=torch.int64)
@@ -598,9 +665,9 @@ class ImitationRLEnv(ManagerBasedRLEnv):
             ).index_select(0, action_index)
             processed_reference_action = (
                 processed_reference_action
-                + joint_vel.to(device=self.device, dtype=processed_reference_action.dtype).index_select(
-                    -1, action_index
-                )
+                + joint_vel.to(
+                    device=self.device, dtype=processed_reference_action.dtype
+                ).index_select(-1, action_index)
                 * pd_ratio
             )
 
@@ -644,7 +711,9 @@ class ImitationRLEnv(ManagerBasedRLEnv):
 
         policy_action = policy_action.detach().to(dtype=torch.float32)
         reference_action = reference_action.detach().to(dtype=torch.float32)
-        reference_nan_frac = float((~torch.isfinite(reference_action)).float().mean().item())
+        reference_nan_frac = float(
+            (~torch.isfinite(reference_action)).float().mean().item()
+        )
 
         policy_action = torch.nan_to_num(policy_action, nan=0.0, posinf=0.0, neginf=0.0)
         reference_action = torch.nan_to_num(
@@ -678,17 +747,19 @@ class ImitationRLEnv(ManagerBasedRLEnv):
         self, policy_raw_action: torch.Tensor
     ) -> dict[str, float]:
         """Compare the rollout action against the aligned reconstructed reference action."""
-        if self.current_reference is None:
+        if self.current_expert_frame is None:
             return {}
 
         reconstructed = self._reconstruct_reference_action_from_reference(
-            self.current_reference
+            self.current_expert_frame
         )
         if reconstructed is None:
             return {}
         reference_raw_action, reference_processed_action = reconstructed
 
-        policy_raw_action = policy_raw_action.to(device=self.device, dtype=torch.float32)
+        policy_raw_action = policy_raw_action.to(
+            device=self.device, dtype=torch.float32
+        )
         if policy_raw_action.shape != reference_raw_action.shape:
             return {}
 
@@ -730,7 +801,9 @@ class ImitationRLEnv(ManagerBasedRLEnv):
 
         actual_state = actual_state.detach().to(dtype=torch.float32)
         reference_state = reference_state.detach().to(dtype=torch.float32)
-        reference_nan_frac = float((~torch.isfinite(reference_state)).float().mean().item())
+        reference_nan_frac = float(
+            (~torch.isfinite(reference_state)).float().mean().item()
+        )
 
         actual_state = torch.nan_to_num(actual_state, nan=0.0, posinf=0.0, neginf=0.0)
         reference_state = torch.nan_to_num(
@@ -751,11 +824,11 @@ class ImitationRLEnv(ManagerBasedRLEnv):
 
     def _compute_rollout_reference_state_log(self) -> dict[str, float]:
         """Compare the post-step robot state against the aligned reference next state."""
-        if self.current_reference is None:
+        if self.current_expert_frame is None:
             return {}
 
-        next_joint_pos = self.current_reference.get(("next", "joint_pos"))
-        next_joint_vel = self.current_reference.get(("next", "joint_vel"))
+        next_joint_pos = self.current_expert_frame.get(("next", "joint_pos"))
+        next_joint_vel = self.current_expert_frame.get(("next", "joint_vel"))
         if next_joint_pos is None or next_joint_vel is None:
             return {}
 
@@ -785,7 +858,9 @@ class ImitationRLEnv(ManagerBasedRLEnv):
         if self._reconstructed_reference_target_to_action_index is None:
             return None
 
-        cached_targets = self.trajectory_manager.get_reconstructed_action_targets(global_indices)
+        cached_targets = self.trajectory_manager.get_reconstructed_action_targets(
+            global_indices
+        )
         if cached_targets is None:
             return None
 
@@ -800,13 +875,15 @@ class ImitationRLEnv(ManagerBasedRLEnv):
                 device=self.device, dtype=q_cmd.dtype
             )
             q_cmd = torch.clamp(q_cmd, min=clip[..., 0], max=clip[..., 1])
-        return self._processed_to_raw_action(q_cmd, env_ids=env_ids, action_term=action_term)
+        return self._processed_to_raw_action(
+            q_cmd, env_ids=env_ids, action_term=action_term
+        )
 
     def _finalize_reference_body_names(self) -> None:
         """Improve reference body-name mapping for datasets that only provide generic names."""
-        ref_body_pos = self.current_reference.get("xpos")
+        ref_body_pos = self.current_expert_frame.get("xpos")
         if ref_body_pos is None:
-            ref_body_pos = self.current_reference.get("body_pos_w")
+            ref_body_pos = self.current_expert_frame.get("body_pos_w")
         if ref_body_pos is None or ref_body_pos.ndim < 3:
             return
 
@@ -839,7 +916,10 @@ class ImitationRLEnv(ManagerBasedRLEnv):
             tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None
         ) = None
         self._mdp_reference_cvel_cache: torch.Tensor | None = None
-        self._mdp_reference_motion_cache: dict[tuple[int, ...], torch.Tensor] = {}
+        self._mdp_expert_motion_cache: dict[tuple[int, ...], torch.Tensor] = {}
+        self._mdp_expert_window_obs_cache: dict[
+            tuple[int, int, str, object], dict[str, torch.Tensor]
+        ] = {}
         self._mdp_reference_body_id_cache: dict[tuple[str, ...], torch.Tensor] = {}
         self._mdp_reference_body_pose_cache: dict[
             tuple[str, ...], tuple[torch.Tensor, torch.Tensor]
@@ -848,7 +928,9 @@ class ImitationRLEnv(ManagerBasedRLEnv):
             tuple[str, ...], tuple[torch.Tensor, torch.Tensor]
         ] = {}
         self._mdp_robot_anchor_id_cache: dict[str, int] = {}
-        self._mdp_robot_anchor_state_cache: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
+        self._mdp_robot_anchor_state_cache: dict[
+            int, tuple[torch.Tensor, torch.Tensor]
+        ] = {}
         self._mdp_robot_body_pose_w_cache: dict[
             object, tuple[torch.Tensor, torch.Tensor]
         ] = {}
@@ -884,7 +966,7 @@ class ImitationRLEnv(ManagerBasedRLEnv):
         self._mdp_reset_pose_bounds: torch.Tensor | None = None
         self._mdp_reset_velocity_bounds: torch.Tensor | None = None
 
-        reference = self.current_reference
+        reference = self.current_expert_frame
         self._mdp_reference_body_pos_key = (
             "xpos" if "xpos" in reference else "body_pos_w"
         )
@@ -916,7 +998,8 @@ class ImitationRLEnv(ManagerBasedRLEnv):
         self._mdp_align_pos = None
         self._mdp_reference_root_cache = None
         self._mdp_reference_cvel_cache = None
-        self._mdp_reference_motion_cache.clear()
+        self._mdp_expert_motion_cache.clear()
+        self._mdp_expert_window_obs_cache.clear()
         self._mdp_reference_body_pose_cache.clear()
         self._mdp_reference_body_velocity_cache.clear()
         self._mdp_robot_anchor_state_cache.clear()
@@ -936,7 +1019,8 @@ class ImitationRLEnv(ManagerBasedRLEnv):
         self._mdp_align_pos = align_pos
         self._mdp_reference_root_cache = None
         self._mdp_reference_cvel_cache = None
-        self._mdp_reference_motion_cache.clear()
+        self._mdp_expert_motion_cache.clear()
+        self._mdp_expert_window_obs_cache.clear()
         self._mdp_reference_body_pose_cache.clear()
         self._mdp_reference_body_velocity_cache.clear()
         self._mdp_robot_anchor_state_cache.clear()
@@ -981,7 +1065,7 @@ class ImitationRLEnv(ManagerBasedRLEnv):
         self._ensure_mdp_step_cache()
         if self._mdp_reference_root_cache is None:
             compiled = _get_mdp_compiled_module()
-            reference = self.current_reference
+            reference = self.current_expert_frame
             root_pos_w, root_quat_w = compiled.transform_root_pose_to_world(
                 self._mdp_align_quat,
                 self._mdp_align_pos,
@@ -1004,7 +1088,7 @@ class ImitationRLEnv(ManagerBasedRLEnv):
     def _get_reference_cvel_fast(self) -> torch.Tensor:
         self._ensure_mdp_step_cache()
         if self._mdp_reference_cvel_cache is None:
-            reference = self.current_reference
+            reference = self.current_expert_frame
             self._mdp_reference_cvel_cache = torch.cat(
                 [reference["body_ang_vel_w"], reference["body_lin_vel_w"]], dim=-1
             )
@@ -1057,7 +1141,7 @@ class ImitationRLEnv(ManagerBasedRLEnv):
         if body_pose is None:
             compiled = _get_mdp_compiled_module()
             ref_body_ids = self._get_reference_body_ids_fast(cache_key)
-            reference = self.current_reference
+            reference = self.current_expert_frame
             ref_pos = reference[self._mdp_reference_body_pos_key].index_select(
                 1, ref_body_ids
             )
@@ -1159,7 +1243,10 @@ class ImitationRLEnv(ManagerBasedRLEnv):
             return body_velocity
         body_ids_t = self._get_body_ids_tensor_fast(body_ids)
         if isinstance(body_ids_t, slice):
-            body_velocity = (self.robot.data.body_ang_vel_w, self.robot.data.body_lin_vel_w)
+            body_velocity = (
+                self.robot.data.body_ang_vel_w,
+                self.robot.data.body_lin_vel_w,
+            )
         else:
             body_velocity = (
                 self.robot.data.body_ang_vel_w.index_select(1, body_ids_t),
@@ -1195,32 +1282,77 @@ class ImitationRLEnv(ManagerBasedRLEnv):
         self._mdp_robot_body_anchor_frame_cache[cache_key] = body_state
         return body_state
 
-    def _get_reference_motion_command_fast(
+    def _get_expert_motion_command_fast(
         self, joint_ids: Sequence[int] | slice
     ) -> torch.Tensor:
         self._ensure_mdp_step_cache()
         if isinstance(joint_ids, slice):
             return torch.cat(
                 [
-                    self.current_reference["joint_pos"],
-                    self.current_reference["joint_vel"],
+                    self.current_expert_frame["joint_pos"],
+                    self.current_expert_frame["joint_vel"],
                 ],
                 dim=-1,
             )
 
         joint_ids_t = self._get_joint_ids_tensor_fast(joint_ids)
         cache_key = tuple(int(joint_id) for joint_id in joint_ids)
-        motion_command = self._mdp_reference_motion_cache.get(cache_key)
+        motion_command = self._mdp_expert_motion_cache.get(cache_key)
         if motion_command is None:
             motion_command = torch.cat(
                 [
-                    self.current_reference["joint_pos"].index_select(-1, joint_ids_t),
-                    self.current_reference["joint_vel"].index_select(-1, joint_ids_t),
+                    self.current_expert_frame["joint_pos"].index_select(-1, joint_ids_t),
+                    self.current_expert_frame["joint_vel"].index_select(-1, joint_ids_t),
                 ],
                 dim=-1,
             )
-            self._mdp_reference_motion_cache[cache_key] = motion_command
+            self._mdp_expert_motion_cache[cache_key] = motion_command
         return motion_command
+
+    def get_agent_latent_command(
+        self, env_ids: torch.Tensor | None = None
+    ) -> torch.Tensor:
+        """Return the current agent-published latent command buffer."""
+        if env_ids is None:
+            return self._agent_latent_command
+        env_ids = env_ids.to(device=self.device, dtype=torch.long)
+        return self._agent_latent_command.index_select(0, env_ids)
+
+    def set_agent_latent_command(
+        self, latent_command: torch.Tensor, env_ids: torch.Tensor | None = None
+    ) -> None:
+        """Publish the latest agent latent command into the env observation state."""
+        latent_command = latent_command.to(device=self.device, dtype=torch.float32)
+        if env_ids is None:
+            if (
+                latent_command.ndim != 2
+                or latent_command.shape != self._agent_latent_command.shape
+            ):
+                raise ValueError(
+                    "Latent command shape mismatch. "
+                    f"Expected {tuple(self._agent_latent_command.shape)}, got {tuple(latent_command.shape)}."
+                )
+            self._agent_latent_command.copy_(latent_command)
+            return
+
+        env_ids = env_ids.to(device=self.device, dtype=torch.long)
+        if latent_command.ndim != 2 or latent_command.shape != (
+            env_ids.shape[0],
+            self._agent_latent_dim,
+        ):
+            raise ValueError(
+                "Latent command shape mismatch for indexed update. "
+                f"Expected {(env_ids.shape[0], self._agent_latent_dim)}, got {tuple(latent_command.shape)}."
+            )
+        self._agent_latent_command.index_copy_(0, env_ids, latent_command)
+
+    def reset_agent_latent_command(self, env_ids: torch.Tensor | None = None) -> None:
+        """Reset latent commands for the selected environments to zeros."""
+        if env_ids is None:
+            self._agent_latent_command.zero_()
+            return
+        env_ids = env_ids.to(device=self.device, dtype=torch.long)
+        self._agent_latent_command.index_fill_(0, env_ids, 0.0)
 
     def _resolve_reference_body_visualization_pairs(
         self,
@@ -1232,8 +1364,8 @@ class ImitationRLEnv(ManagerBasedRLEnv):
         reference_body_pos = None
         reference_body_quat = None
         try:
-            reference_body_pos = self.get_reference_data("xpos")
-            reference_body_quat = self.get_reference_data("xquat")
+            reference_body_pos = self.get_expert_trajectory_data("xpos")
+            reference_body_quat = self.get_expert_trajectory_data("xquat")
         except KeyError:
             pass
         if reference_body_pos is None or reference_body_quat is None:
@@ -1392,19 +1524,21 @@ class ImitationRLEnv(ManagerBasedRLEnv):
             if isinstance(src_value, TensorDict) and isinstance(dst_value, TensorDict):
                 self._index_copy_reference_rows_(dst_value, src_value, env_ids)
                 continue
-            if isinstance(src_value, torch.Tensor) and isinstance(dst_value, torch.Tensor):
+            if isinstance(src_value, torch.Tensor) and isinstance(
+                dst_value, torch.Tensor
+            ):
                 dst_value.index_copy_(0, env_ids, src_value)
                 continue
             dst.set(key, src_value)
 
-    def _refresh_current_reference(
+    def _refresh_current_expert_frame(
         self, env_ids: torch.Tensor | None = None, *, advance: bool = False
     ) -> None:
         reference = self.trajectory_manager.sample(env_ids=env_ids, advance=advance)
-        if env_ids is None or self.current_reference is None:
-            self.current_reference = reference
+        if env_ids is None or self.current_expert_frame is None:
+            self.current_expert_frame = reference
         else:
-            self._index_copy_reference_rows_(self.current_reference, reference, env_ids)
+            self._index_copy_reference_rows_(self.current_expert_frame, reference, env_ids)
         self._invalidate_mdp_cache()
 
     def _reset_idx(self, env_ids: torch.Tensor):
@@ -1417,11 +1551,21 @@ class ImitationRLEnv(ManagerBasedRLEnv):
             manager see consistent indexing.
         """
 
-        # Reset trajectory tracking (reassigns trajectories and resets steps)
-        self.trajectory_manager.reset_envs(env_ids.clone())
+        # Reset trajectory tracking (reassigns trajectories and resets steps).
+        reset_steps = None
+        if self._random_reset_step_max > self._random_reset_step_min:
+            reset_steps = torch.randint(
+                low=self._random_reset_step_min,
+                high=self._random_reset_step_max + 1,
+                size=(int(env_ids.shape[0]),),
+                device=self.trajectory_manager._state_device,
+                dtype=torch.long,
+            )
+        self.trajectory_manager.reset_envs(env_ids.clone(), steps=reset_steps)
+        self.reset_agent_latent_command(env_ids)
 
-        # Refresh only the resetting rows before reset events consume current_reference.
-        self._refresh_current_reference(env_ids, advance=False)
+        # Refresh only the resetting rows before reset events consume current_expert_frame.
+        self._refresh_current_expert_frame(env_ids, advance=False)
 
         # Trigger the reset events (curriculum, sensors, managers, etc.) using tensor indices
         result = super()._reset_idx(env_ids)  # type: ignore[arg-type]
@@ -1431,8 +1575,8 @@ class ImitationRLEnv(ManagerBasedRLEnv):
         self._init_root_pos.index_copy_(0, env_ids, reset_root_state_w[:, 0:3])
         self._init_root_quat.index_copy_(0, env_ids, reset_root_state_w[:, 3:7])
 
-        reference_root_pos = self.current_reference.get("root_pos")
-        reference_root_quat = self.current_reference.get("root_quat")
+        reference_root_pos = self.current_expert_frame.get("root_pos")
+        reference_root_quat = self.current_expert_frame.get("root_quat")
         if reference_root_pos is not None:
             self._reference_reset_root_pos.index_copy_(
                 0, env_ids, reference_root_pos.index_select(0, env_ids)
@@ -1458,7 +1602,7 @@ class ImitationRLEnv(ManagerBasedRLEnv):
         # Standard RL stepping path.
         if not self.replay_only:
             # Get next reference data point (advance=True to move to next step)
-            self._refresh_current_reference(advance=True)
+            self._refresh_current_expert_frame(advance=True)
             rollout_action_log = self._compute_rollout_reference_action_log(
                 action.to(self.device)
             )
@@ -1479,7 +1623,7 @@ class ImitationRLEnv(ManagerBasedRLEnv):
         # `sample(advance=True)` returns frame t and then increments to t+1.
         # This avoids double-advance while keeping reward computation aligned with frame t.
         reference_for_step = self.trajectory_manager.sample(env_ids=None, advance=True)
-        self.current_reference = reference_for_step
+        self.current_expert_frame = reference_for_step
         self._invalidate_mdp_cache()
         self._replay_reference(reference=reference_for_step)
         self.scene.update(dt=0.0)
@@ -1548,7 +1692,7 @@ class ImitationRLEnv(ManagerBasedRLEnv):
             self.event_manager.apply(mode="interval", dt=self.step_dt)
         # Expose post-step reference (frame t+1) for observations/outputs, matching
         # ManagerBasedRLEnv command timing after command_manager.compute().
-        self._refresh_current_reference(advance=False)
+        self._refresh_current_expert_frame(advance=False)
         # -- compute observations
         # note: done after reset to get the correct observations for reset envs
         self.obs_buf = self.observation_manager.compute(update_history=True)
@@ -1563,7 +1707,7 @@ class ImitationRLEnv(ManagerBasedRLEnv):
             self.extras,
         )
 
-    def get_reference_data(
+    def get_expert_trajectory_data(
         self, key: str | None = None, joint_indices: Sequence[int] | None = None
     ) -> TensorDict | torch.Tensor:
         """
@@ -1575,24 +1719,24 @@ class ImitationRLEnv(ManagerBasedRLEnv):
         Returns:
             Reference data for all environments
         """
-        if self.current_reference is None:
+        if self.current_expert_frame is None:
             raise RuntimeError("No reference data available. Call reset() first.")
 
         if key is None:
-            return self.current_reference
+            return self.current_expert_frame
 
         data: torch.Tensor | TensorDict | None = None
-        if key in self.current_reference:
-            data = self.current_reference[key]
-        elif key == "xpos" and "body_pos_w" in self.current_reference:
-            data = self.current_reference["body_pos_w"]
-        elif key == "xquat" and "body_quat_w" in self.current_reference:
-            data = self.current_reference["body_quat_w"]
+        if key in self.current_expert_frame:
+            data = self.current_expert_frame[key]
+        elif key == "xpos" and "body_pos_w" in self.current_expert_frame:
+            data = self.current_expert_frame["body_pos_w"]
+        elif key == "xquat" and "body_quat_w" in self.current_expert_frame:
+            data = self.current_expert_frame["body_quat_w"]
         elif key == "cvel":
             data = self._get_reference_cvel_fast()
 
         if data is None:
-            available_keys = [str(k) for k in self.current_reference.keys()]
+            available_keys = [str(k) for k in self.current_expert_frame.keys()]
             raise KeyError(f"Key '{key}' not found. Available keys: {available_keys}")
 
         if joint_indices is not None:
@@ -1618,38 +1762,126 @@ class ImitationRLEnv(ManagerBasedRLEnv):
             return key_parts[0]
         return key_parts
 
-    def _sample_reference_batch_for_expert(
+    @staticmethod
+    def _select_last_dim(
+        values: torch.Tensor, ids: torch.Tensor | slice
+    ) -> torch.Tensor:
+        if isinstance(ids, slice):
+            return values
+        return values.index_select(-1, ids)
+
+    @staticmethod
+    def _joint_ids_cache_key(joint_ids: torch.Tensor | Sequence[int] | slice) -> object:
+        if isinstance(joint_ids, slice):
+            return ("all",)
+        if isinstance(joint_ids, torch.Tensor):
+            return tuple(int(idx) for idx in joint_ids.tolist())
+        return tuple(int(idx) for idx in joint_ids)
+
+    def _sample_expert_trajectory_batch(
         self, batch_size: int
     ) -> tuple[TensorDict, torch.Tensor, torch.Tensor]:
-        """Sample random reference transitions without advancing env manager state."""
+        """Sample random expert transitions without advancing env manager state."""
         if batch_size <= 0:
             raise ValueError("batch_size must be > 0.")
 
-        reference, env_ids_tm, global_indices = (
+        expert_frame, env_ids_tm, global_indices = (
             self.trajectory_manager.sample_random_transitions(batch_size)
         )
         return (
-            reference.to(self.device),
+            expert_frame.to(self.device),
             env_ids_tm.to(self.device),
             global_indices.to(self.device),
         )
 
-    def _reference_obs_by_term(
+    def _expert_local_steps_from_global_indices(
         self,
-        reference: TensorDict,
+        env_ids: torch.Tensor,
+        global_indices: torch.Tensor,
+    ) -> torch.Tensor:
+        """Convert replay-buffer global indices back to local trajectory steps."""
+        tm = self.trajectory_manager
+        env_ids_tm = env_ids.to(device=tm._state_device, dtype=torch.long)
+        global_indices_tm = global_indices.to(device=tm._state_device, dtype=torch.long)
+        traj_ranks = tm.env_traj_rank[env_ids_tm]
+        local_steps = global_indices_tm - tm._start[traj_ranks]
+        return local_steps.to(device=self.device, dtype=torch.long)
+
+    def _current_local_steps(self, env_ids: torch.Tensor) -> torch.Tensor:
+        tm = self.trajectory_manager
+        return tm.env_step[
+            env_ids.to(device=tm._state_device, dtype=torch.long)
+        ].to(device=self.device, dtype=torch.long)
+
+    def _sample_expert_window_slice(
+        self,
+        env_ids: torch.Tensor,
+        local_steps: torch.Tensor,
+        *,
+        past_steps: int,
+        future_steps: int,
+    ) -> TensorDict:
+        """Sample an oldest-to-newest expert window around each requested step."""
+        if past_steps < 0 or future_steps < 0:
+            raise ValueError("Expert window steps must be >= 0.")
+        tm = self.trajectory_manager
+        env_ids_tm = env_ids.to(device=tm._state_device, dtype=torch.long)
+        local_steps_tm = local_steps.to(device=tm._state_device, dtype=torch.long)
+        window_offsets = torch.arange(
+            -past_steps,
+            future_steps + 1,
+            device=tm._state_device,
+            dtype=torch.long,
+        )
+        window_steps = local_steps_tm.unsqueeze(1) + window_offsets.unsqueeze(0)
+        window_steps = window_steps.clamp(min=0)
+        expert_window = tm.sample_slice(
+            batch_size=int(window_offsets.shape[0]),
+            env_ids=env_ids_tm,
+            start_steps=window_steps,
+            mode="independent",
+        )
+        return expert_window.to(self.device)
+
+    def _expert_body_pose_fields(
+        self, expert_td: TensorDict
+    ) -> tuple[torch.Tensor, torch.Tensor, int]:
+        ref_body_pos_key = (
+            self._mdp_reference_body_pos_key
+            if hasattr(self, "_mdp_reference_body_pos_key")
+            and self._mdp_reference_body_pos_key in expert_td.keys()
+            else ("xpos" if "xpos" in expert_td.keys() else "body_pos_w")
+        )
+        ref_body_quat_key = (
+            self._mdp_reference_body_quat_key
+            if hasattr(self, "_mdp_reference_body_quat_key")
+            and self._mdp_reference_body_quat_key in expert_td.keys()
+            else ("xquat" if "xquat" in expert_td.keys() else "body_quat_w")
+        )
+        body_pos = expert_td.get(ref_body_pos_key)
+        body_quat = expert_td.get(ref_body_quat_key)
+        if body_pos is None or body_quat is None:
+            raise KeyError(
+                "Expert batch is missing body pose fields required for expert observations."
+            )
+        return body_pos, body_quat, body_pos.ndim - 2
+
+    def _raw_expert_state_terms(
+        self,
+        expert_frame: TensorDict,
         env_ids: torch.Tensor,
         *,
         prefix: tuple[str, ...] = (),
     ) -> dict[str, torch.Tensor]:
-        """Convert sampled reference data to observation-compatible tensors."""
-        env_ids = env_ids.to(dtype=torch.int64, device=self.device)
-        key = (lambda name: name) if len(prefix) == 0 else (lambda name: (*prefix, name))
-        root_pos_ref = reference.get(key("root_pos"))
-        root_quat_ref = reference.get(key("root_quat"))
-        root_lin_vel_ref = reference.get(key("root_lin_vel"))
-        root_ang_vel_ref = reference.get(key("root_ang_vel"))
-        joint_pos_ref = reference.get(key("joint_pos"))
-        joint_vel_ref = reference.get(key("joint_vel"))
+        key = (
+            (lambda name: name) if len(prefix) == 0 else (lambda name: (*prefix, name))
+        )
+        root_pos_ref = expert_frame.get(key("root_pos"))
+        root_quat_ref = expert_frame.get(key("root_quat"))
+        root_lin_vel_ref = expert_frame.get(key("root_lin_vel"))
+        root_ang_vel_ref = expert_frame.get(key("root_ang_vel"))
+        joint_pos_ref = expert_frame.get(key("joint_pos"))
+        joint_vel_ref = expert_frame.get(key("joint_vel"))
         if (
             root_pos_ref is None
             or root_quat_ref is None
@@ -1659,91 +1891,299 @@ class ImitationRLEnv(ManagerBasedRLEnv):
             or joint_vel_ref is None
         ):
             raise KeyError(
-                f"Reference batch is missing fields for prefix {prefix or ('current',)}."
+                f"Expert batch is missing fields for prefix {prefix or ('current',)}."
             )
+
         root_pos_w, root_quat_w_opt = self._transform_reference_pose_to_world(
             root_pos_ref, root_quat_ref, env_ids=env_ids
         )
         if root_quat_w_opt is None:
-            raise RuntimeError(
-                "Failed to transform reference quaternion for expert sampling."
-            )
+            raise RuntimeError("Failed to transform expert quaternion for sampling.")
         root_quat_w = root_quat_w_opt
-        env_origins = self.scene.env_origins.index_select(0, env_ids)
+
+        scene = getattr(self, "scene", None)
+        if scene is None:
+            env_origins = self._expert_env_origins.index_select(0, env_ids)
+        else:
+            env_origins = scene.env_origins.index_select(0, env_ids)
         root_pos = root_pos_w - env_origins
+
         align_quat, _ = self._get_reference_alignment_transform(env_ids)
         root_lin_vel = math_utils.quat_apply(align_quat, root_lin_vel_ref)
         root_ang_vel = math_utils.quat_apply(align_quat, root_ang_vel_ref)
-        default_joint_pos = self.robot.data.default_joint_pos.index_select(0, env_ids)
-        default_joint_vel = self.robot.data.default_joint_vel.index_select(0, env_ids)
-        batch_size = int(env_ids.shape[0])
-        identity_rot6d = torch.zeros(
-            (batch_size, 6),
-            device=self.device,
-            dtype=root_quat_w.dtype,
-        )
-        identity_rot6d[:, 0] = 1.0
-        identity_rot6d[:, 4] = 1.0
-        zero_anchor_pos = torch.zeros(
-            (batch_size, 3),
-            device=self.device,
-            dtype=root_pos.dtype,
-        )
-        current_action = getattr(self.action_manager, "action", None)
-        if isinstance(current_action, torch.Tensor):
-            zero_last_action = torch.zeros_like(current_action.index_select(0, env_ids))
-        else:
-            action_space = getattr(
-                self, "single_action_space", getattr(self, "action_space", None)
-            )
-            action_shape = (
-                tuple(int(dim) for dim in action_space.shape)
-                if action_space is not None and getattr(action_space, "shape", None)
-                else (1,)
-            )
-            zero_last_action = torch.zeros(
-                (batch_size, *action_shape),
-                device=self.device,
-                dtype=torch.float32,
-            )
 
         return {
             "joint_pos": joint_pos_ref,
             "joint_vel": joint_vel_ref,
-            "joint_pos_rel": joint_pos_ref - default_joint_pos,
-            "joint_vel_rel": joint_vel_ref - default_joint_vel,
             "root_pos": root_pos,
             "root_quat": root_quat_w,
             "root_lin_vel": root_lin_vel,
             "root_ang_vel": root_ang_vel,
-            "reference_motion": torch.cat([joint_pos_ref, joint_vel_ref], dim=-1),
-            # Expert-state observations treat robot and reference as aligned.
-            "reference_anchor_pos_b": zero_anchor_pos,
-            "reference_anchor_ori_b": identity_rot6d,
-            # Previous expert action is not available from the reference sampler here.
-            "last_action": zero_last_action,
-            # Backward-compatible aliases.
-            "base_lin_vel": root_lin_vel,
-            "base_ang_vel": root_ang_vel,
+            "expert_motion": torch.cat([joint_pos_ref, joint_vel_ref], dim=-1),
         }
 
-    def _reference_to_requested_obs(
+    def _expert_anchor_terms(
         self,
-        reference: TensorDict,
+        expert_frame: TensorDict,
+        env_ids: torch.Tensor,
+        *,
+        context: str,
+        anchor_body_name: str = "torso_link",
+    ) -> dict[str, torch.Tensor]:
+        batch_size = int(env_ids.shape[0])
+        if context == "expert":
+            zero_anchor_pos = torch.zeros((batch_size, 3), device=self.device)
+            identity_rot6d = torch.zeros((batch_size, 6), device=self.device)
+            identity_rot6d[:, 0] = 1.0
+            identity_rot6d[:, 4] = 1.0
+            return {
+                "expert_anchor_pos_b": zero_anchor_pos,
+                "expert_anchor_ori_b": identity_rot6d,
+            }
+        if context != "rollout":
+            raise ValueError(f"Unsupported expert observation context: {context!r}.")
+
+        compiled = _get_mdp_compiled_module()
+        body_pos_source, body_quat_source, body_dim = self._expert_body_pose_fields(
+            expert_frame
+        )
+        anchor_ids = self._get_reference_body_ids_fast((anchor_body_name,))
+        expert_anchor_pos = body_pos_source.index_select(body_dim, anchor_ids).squeeze(
+            body_dim
+        )
+        expert_anchor_quat = body_quat_source.index_select(
+            body_dim, anchor_ids
+        ).squeeze(body_dim)
+        expert_anchor_pos_w, expert_anchor_quat_w_opt = (
+            self._transform_reference_pose_to_world(
+                expert_anchor_pos, expert_anchor_quat, env_ids=env_ids
+            )
+        )
+        if expert_anchor_quat_w_opt is None:
+            raise RuntimeError(
+                "Failed to transform expert anchor quaternion for rollout observations."
+            )
+        robot_anchor_pos_w, robot_anchor_quat_w = self._get_robot_anchor_state_w_fast(
+            anchor_body_name
+        )
+        robot_anchor_pos_w = robot_anchor_pos_w.index_select(0, env_ids)
+        robot_anchor_quat_w = robot_anchor_quat_w.index_select(0, env_ids)
+        anchor_pos_b, anchor_ori_b = compiled.body_pose_in_anchor_frame(
+            robot_anchor_pos_w,
+            robot_anchor_quat_w,
+            expert_anchor_pos_w,
+            expert_anchor_quat_w_opt,
+        )
+        return {
+            "expert_anchor_pos_b": anchor_pos_b[:, 0, :],
+            "expert_anchor_ori_b": compiled.quat_to_rot6d_flat(anchor_ori_b[:, 0, :]),
+        }
+
+    def _build_expert_window_terms(
+        self,
+        expert_window: TensorDict,
+        env_ids: torch.Tensor,
+        *,
+        context: str,
+        past_steps: int,
+        joint_ids: torch.Tensor | Sequence[int] | slice = slice(None),
+        anchor_body_name: str = "torso_link",
+    ) -> dict[str, torch.Tensor]:
+        compiled = _get_mdp_compiled_module()
+        batch_size = int(env_ids.shape[0])
+        joint_ids_t = self._get_joint_ids_tensor_fast(joint_ids)
+        joint_pos = self._select_last_dim(expert_window["joint_pos"], joint_ids_t)
+        joint_vel = self._select_last_dim(expert_window["joint_vel"], joint_ids_t)
+        expert_motion = torch.cat([joint_pos, joint_vel], dim=-1).reshape(batch_size, -1)
+
+        body_pos_source, body_quat_source, body_dim = self._expert_body_pose_fields(
+            expert_window
+        )
+        anchor_ids = self._get_reference_body_ids_fast((anchor_body_name,))
+        anchor_pos = body_pos_source.index_select(body_dim, anchor_ids).squeeze(body_dim)
+        anchor_quat = body_quat_source.index_select(body_dim, anchor_ids).squeeze(
+            body_dim
+        )
+
+        if context == "expert":
+            center_index = int(past_steps)
+            center_anchor_pos = anchor_pos[:, center_index, :]
+            center_anchor_quat = anchor_quat[:, center_index, :]
+            anchor_pos_b, anchor_ori_b = compiled.body_pose_in_anchor_frame(
+                center_anchor_pos,
+                center_anchor_quat,
+                anchor_pos,
+                anchor_quat,
+            )
+        elif context == "rollout":
+            window_size = int(anchor_pos.shape[1])
+            flat_env_ids = env_ids[:, None].expand(-1, window_size).reshape(-1)
+            anchor_pos_w, anchor_quat_w_opt = self._transform_reference_pose_to_world(
+                anchor_pos.reshape(-1, 3),
+                anchor_quat.reshape(-1, 4),
+                env_ids=flat_env_ids,
+            )
+            if anchor_quat_w_opt is None:
+                raise RuntimeError(
+                    "Failed to transform expert-window anchor quaternion for rollout observations."
+                )
+            anchor_pos_w = anchor_pos_w.reshape(batch_size, window_size, 3)
+            anchor_quat_w = anchor_quat_w_opt.reshape(batch_size, window_size, 4)
+            robot_anchor_pos_w, robot_anchor_quat_w = self._get_robot_anchor_state_w_fast(
+                anchor_body_name
+            )
+            robot_anchor_pos_w = robot_anchor_pos_w.index_select(0, env_ids)
+            robot_anchor_quat_w = robot_anchor_quat_w.index_select(0, env_ids)
+            anchor_pos_b, anchor_ori_b = compiled.body_pose_in_anchor_frame(
+                robot_anchor_pos_w,
+                robot_anchor_quat_w,
+                anchor_pos_w,
+                anchor_quat_w,
+            )
+        else:
+            raise ValueError(f"Unsupported expert-window context: {context!r}.")
+
+        return {
+            "expert_motion": expert_motion,
+            "expert_anchor_pos_b": anchor_pos_b.reshape(batch_size, -1),
+            "expert_anchor_ori_b": compiled.quat_to_rot6d_flat(anchor_ori_b).reshape(
+                batch_size, -1
+            ),
+        }
+
+    def _get_current_expert_window_terms(
+        self,
+        *,
+        past_steps: int,
+        future_steps: int,
+        joint_ids: torch.Tensor | Sequence[int] | slice = slice(None),
+        anchor_body_name: str = "torso_link",
+    ) -> dict[str, torch.Tensor]:
+        self._ensure_mdp_step_cache()
+        joint_ids_t = self._get_joint_ids_tensor_fast(joint_ids)
+        cache_key = (
+            int(past_steps),
+            int(future_steps),
+            str(anchor_body_name),
+            self._joint_ids_cache_key(joint_ids_t),
+        )
+        cached_terms = self._mdp_expert_window_obs_cache.get(cache_key)
+        if cached_terms is not None:
+            return cached_terms
+
+        env_ids = torch.arange(self.num_envs, device=self.device, dtype=torch.long)
+        local_steps = self._current_local_steps(env_ids)
+        expert_window = self._sample_expert_window_slice(
+            env_ids,
+            local_steps,
+            past_steps=int(past_steps),
+            future_steps=int(future_steps),
+        )
+        cached_terms = self._build_expert_window_terms(
+            expert_window,
+            env_ids,
+            context="rollout",
+            past_steps=int(past_steps),
+            joint_ids=joint_ids_t,
+            anchor_body_name=anchor_body_name,
+        )
+        self._mdp_expert_window_obs_cache[cache_key] = cached_terms
+        return cached_terms
+
+    def get_current_expert_window_term(
+        self,
+        term_name: str,
+        *,
+        past_steps: int,
+        future_steps: int,
+        joint_ids: torch.Tensor | Sequence[int] | slice = slice(None),
+        anchor_body_name: str = "torso_link",
+        env_ids: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        value = self._get_current_expert_window_terms(
+            past_steps=int(past_steps),
+            future_steps=int(future_steps),
+            joint_ids=joint_ids,
+            anchor_body_name=anchor_body_name,
+        )[term_name]
+        if env_ids is None:
+            return value
+        env_ids = env_ids.to(device=self.device, dtype=torch.long)
+        return value.index_select(0, env_ids)
+
+    def _map_requested_expert_observations(
+        self,
+        expert_frame: TensorDict,
         env_ids: torch.Tensor,
         obs_keys: Sequence[NestedKey],
         *,
+        context: str,
         prefix: tuple[str, ...] = (),
+        local_steps: torch.Tensor | None = None,
+        past_steps: int,
+        future_steps: int,
     ) -> dict[NestedKey, torch.Tensor] | None:
-        """Map requested nested observation keys to tensors from sampled reference."""
-        term_values = self._reference_obs_by_term(reference, env_ids, prefix=prefix)
         mapped_values: dict[NestedKey, torch.Tensor] = {}
         unknown_terms: list[str] = []
+        raw_state_terms = self._raw_expert_state_terms(expert_frame, env_ids, prefix=prefix)
+        anchor_terms_cache: dict[str, dict[str, torch.Tensor]] = {}
+        window_terms_cache: dict[tuple[int, int, str, object], dict[str, torch.Tensor]] = {}
 
         for obs_key in obs_keys:
             key_tuple = self._normalize_nested_key(obs_key)
+            group_name = key_tuple[0] if len(key_tuple) > 1 else "expert_state"
             term_name = key_tuple[-1]
-            value = term_values.get(term_name)
+
+            if group_name == "expert_window":
+                if len(prefix) > 0:
+                    unknown_terms.append(term_name)
+                    continue
+                if local_steps is None:
+                    logger.warning(
+                        "Expert mapper received expert_window requests without trajectory-local steps."
+                    )
+                    return None
+                cache_key = (
+                    int(past_steps),
+                    int(future_steps),
+                    "torso_link",
+                    ("all",),
+                )
+                if cache_key not in window_terms_cache:
+                    expert_window = self._sample_expert_window_slice(
+                        env_ids,
+                        local_steps,
+                        past_steps=int(past_steps),
+                        future_steps=int(future_steps),
+                    )
+                    window_terms_cache[cache_key] = self._build_expert_window_terms(
+                        expert_window,
+                        env_ids,
+                        context=context,
+                        past_steps=int(past_steps),
+                        joint_ids=slice(None),
+                        anchor_body_name="torso_link",
+                    )
+                value = window_terms_cache[cache_key].get(term_name)
+            elif group_name in {"expert_state", "", "policy", "critic"}:
+                value = raw_state_terms.get(term_name)
+                if value is None and term_name in {
+                    "expert_anchor_pos_b",
+                    "expert_anchor_ori_b",
+                }:
+                    anchor_terms = anchor_terms_cache.get("torso_link")
+                    if anchor_terms is None:
+                        anchor_terms = self._expert_anchor_terms(
+                            expert_frame,
+                            env_ids,
+                            context=context,
+                            anchor_body_name="torso_link",
+                        )
+                        anchor_terms_cache["torso_link"] = anchor_terms
+                    value = anchor_terms.get(term_name)
+            else:
+                value = None
+
             if value is None:
                 unknown_terms.append(term_name)
                 continue
@@ -1762,10 +2202,14 @@ class ImitationRLEnv(ManagerBasedRLEnv):
 
         return mapped_values
 
-    def sample_expert_batch(
-        self, batch_size: int, required_keys: Sequence[NestedKey]
+    def _sample_expert_batch_impl(
+        self,
+        batch_size: int,
+        required_keys: Sequence[NestedKey],
+        *,
+        past_steps: int,
+        future_steps: int,
     ) -> TensorDict | None:
-        """Sample an expert batch for imitation algorithms from trajectory manager."""
         if batch_size <= 0:
             return None
         if len(required_keys) == 0:
@@ -1789,7 +2233,7 @@ class ImitationRLEnv(ManagerBasedRLEnv):
             current_obs_keys.append(self._denormalize_nested_key(key_tuple))
 
         expert_batch = TensorDict({}, batch_size=[batch_size], device=self.device)
-        current_reference: TensorDict | None = None
+        current_expert_frame: TensorDict | None = None
         current_env_ids: torch.Tensor | None = None
         current_global_indices: torch.Tensor | None = None
 
@@ -1798,18 +2242,36 @@ class ImitationRLEnv(ManagerBasedRLEnv):
             or needs_action
             or (len(next_obs_keys) > 0 and self._reference_has_aligned_next)
         )
-
         if needs_current_transition:
-            current_reference, current_env_ids, current_global_indices = (
-                self._sample_reference_batch_for_expert(batch_size)
+            current_expert_frame, current_env_ids, current_global_indices = (
+                self._sample_expert_trajectory_batch(batch_size)
+            )
+
+        current_local_steps: torch.Tensor | None = None
+        if (
+            current_expert_frame is not None
+            and current_env_ids is not None
+            and current_global_indices is not None
+        ):
+            current_local_steps = self._expert_local_steps_from_global_indices(
+                current_env_ids,
+                current_global_indices,
             )
 
         if len(current_obs_keys) > 0:
-            assert current_reference is not None and current_env_ids is not None
-            mapped_current = self._reference_to_requested_obs(
-                current_reference,
+            assert (
+                current_expert_frame is not None
+                and current_env_ids is not None
+                and current_local_steps is not None
+            )
+            mapped_current = self._map_requested_expert_observations(
+                current_expert_frame,
                 current_env_ids,
                 current_obs_keys,
+                context="expert",
+                local_steps=current_local_steps,
+                past_steps=int(past_steps),
+                future_steps=int(future_steps),
             )
             if mapped_current is None:
                 return None
@@ -1818,20 +2280,23 @@ class ImitationRLEnv(ManagerBasedRLEnv):
 
         if len(next_obs_keys) > 0:
             if self._reference_has_aligned_next:
-                assert current_reference is not None and current_env_ids is not None
-                next_reference = current_reference
+                assert current_expert_frame is not None and current_env_ids is not None
+                next_expert_frame = current_expert_frame
                 next_env_ids = current_env_ids
                 next_prefix = ("next",)
             else:
-                next_reference, next_env_ids, _ = self._sample_reference_batch_for_expert(
+                next_expert_frame, next_env_ids, _ = self._sample_expert_trajectory_batch(
                     batch_size
                 )
                 next_prefix = ()
-            mapped_next = self._reference_to_requested_obs(
-                next_reference,
+            mapped_next = self._map_requested_expert_observations(
+                next_expert_frame,
                 next_env_ids,
                 next_obs_keys,
+                context="expert",
                 prefix=next_prefix,
+                past_steps=int(past_steps),
+                future_steps=int(future_steps),
             )
             if mapped_next is None:
                 return None
@@ -1850,11 +2315,11 @@ class ImitationRLEnv(ManagerBasedRLEnv):
                     global_indices=current_global_indices,
                     env_ids=current_env_ids,
                 )
-            if current_reference is not None and "action" in current_reference.keys():
+            if current_expert_frame is not None and "action" in current_expert_frame.keys():
                 sampled_action = (
                     sampled_action
                     if sampled_action is not None
-                    else current_reference.get("action")
+                    else current_expert_frame.get("action")
                 )
             if sampled_action is None:
                 if not self._expert_sampler_warned_action_fallback:
@@ -1881,6 +2346,17 @@ class ImitationRLEnv(ManagerBasedRLEnv):
 
         return expert_batch
 
+    def sample_expert_batch(
+        self, batch_size: int, required_keys: Sequence[NestedKey]
+    ) -> TensorDict | None:
+        """Sample an expert batch for imitation algorithms from trajectory manager."""
+        return self._sample_expert_batch_impl(
+            batch_size,
+            required_keys,
+            past_steps=int(self._latent_patch_past_steps),
+            future_steps=int(self._latent_patch_future_steps),
+        )
+
     def _replay_reference(
         self, env_ids: torch.Tensor | None = None, reference: TensorDict | None = None
     ):
@@ -1888,12 +2364,12 @@ class ImitationRLEnv(ManagerBasedRLEnv):
         If env_ids is not provided, replay the reference data for all environments."""
 
         if env_ids is None:
-            ref = self.current_reference if reference is None else reference
+            ref = self.current_expert_frame if reference is None else reference
             defaults_pos = self.robot.data.default_joint_pos
             defaults_vel = self.robot.data.default_joint_vel
         else:
             env_ids_tensor = env_ids
-            full_reference = self.current_reference if reference is None else reference
+            full_reference = self.current_expert_frame if reference is None else reference
             ref = full_reference[env_ids_tensor]
             defaults_pos = self.robot.data.default_joint_pos[env_ids_tensor]
             defaults_vel = self.robot.data.default_joint_vel[env_ids_tensor]
@@ -1936,10 +2412,10 @@ class ImitationRLEnv(ManagerBasedRLEnv):
 
     def _get_tracked_reference_root_pos_w(self) -> torch.Tensor | None:
         """Return tracked reference root positions in world frame for all environments."""
-        if self.current_reference is None:
+        if self.current_expert_frame is None:
             return None
 
-        reference_root_pos = self.current_reference.get("root_pos")
+        reference_root_pos = self.current_expert_frame.get("root_pos")
         if reference_root_pos is None:
             return None
 
@@ -2033,7 +2509,7 @@ class ImitationRLEnv(ManagerBasedRLEnv):
         """Update marker pose/scale from current reference linear velocity."""
         if not self._reference_vel_vis_enabled:
             return
-        if self.current_reference is None:
+        if self.current_expert_frame is None:
             return
         if not self.robot.is_initialized:
             return
@@ -2048,7 +2524,7 @@ class ImitationRLEnv(ManagerBasedRLEnv):
             ref_root_pos_w = tracked_root_pos_w
             align_quat, _ = self._get_reference_alignment_transform()
             ref_root_quat_w = math_utils.quat_mul(
-                align_quat, self.current_reference["root_quat"]
+                align_quat, self.current_expert_frame["root_quat"]
             )
             if ref_root_pos_w is not None:
                 self._goal_root_frame_marker.visualize(
@@ -2069,8 +2545,8 @@ class ImitationRLEnv(ManagerBasedRLEnv):
             reference_body_pos = None
             reference_body_quat = None
             try:
-                reference_body_pos = self.get_reference_data("xpos")
-                reference_body_quat = self.get_reference_data("xquat")
+                reference_body_pos = self.get_expert_trajectory_data("xpos")
+                reference_body_quat = self.get_expert_trajectory_data("xquat")
             except KeyError:
                 pass
 
@@ -2115,9 +2591,9 @@ class ImitationRLEnv(ManagerBasedRLEnv):
 
     def _update_env0_velocity_metrics(self) -> None:
         """Expose env[0] velocity tracking metrics in extras for easy logging."""
-        if self.current_reference is None or self.num_envs < 1:
+        if self.current_expert_frame is None or self.num_envs < 1:
             return
-        reference_root_pos = self.current_reference.get("root_pos")
+        reference_root_pos = self.current_expert_frame.get("root_pos")
         if reference_root_pos is None:
             return
 
