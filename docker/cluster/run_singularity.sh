@@ -47,12 +47,14 @@ build_g1_preflight_cmd() {
     local quoted_expected_motion_count=""
     local quoted_repo_id=""
     local quoted_manifest_refresh_policy=""
+    local quoted_hf_token_check_repo_id=""
 
     printf -v quoted_data_root '%q' "$data_root"
     printf -v quoted_manifest_path '%q' "$manifest_path"
     printf -v quoted_expected_motion_count '%q' "$expected_motion_count"
     printf -v quoted_repo_id '%q' "$repo_id"
     printf -v quoted_manifest_refresh_policy '%q' "$manifest_refresh_policy"
+    printf -v quoted_hf_token_check_repo_id '%q' "$repo_id"
 
     cat <<EOF
 cluster_g1_data_root=${quoted_data_root}
@@ -60,8 +62,30 @@ cluster_g1_manifest_path=${quoted_manifest_path}
 cluster_g1_expected_motion_count=${quoted_expected_motion_count}
 cluster_g1_repo_id=${quoted_repo_id}
 cluster_g1_manifest_refresh_policy=${quoted_manifest_refresh_policy}
+cluster_g1_hf_token="\${HF_TOKEN:-\${HUGGINGFACE_HUB_TOKEN:-}}"
 cluster_g1_npz_dir="\${cluster_g1_data_root}/npz/g1"
 cluster_g1_npz_count=0
+
+if [ -z "\${cluster_g1_hf_token}" ]; then
+    echo "[ERROR] Hugging Face token is missing in the container runtime. Set CLUSTER_HF_TOKEN_FILE=.hf_token or CLUSTER_HF_TOKEN so gated dataset downloads can authenticate." >&2
+    exit 1
+fi
+
+echo "[INFO] Verifying Hugging Face access for dataset repo '\${cluster_g1_repo_id}'."
+if ! /isaac-sim/python.sh - <<PY
+from huggingface_hub import HfApi
+import os
+
+repo_id = ${quoted_hf_token_check_repo_id}
+token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_HUB_TOKEN")
+
+HfApi().repo_info(repo_id=repo_id, repo_type="dataset", token=token)
+print(f"[INFO] Hugging Face access check passed for {repo_id}")
+PY
+then
+    echo "[ERROR] Hugging Face token does not have access to dataset repo '\${cluster_g1_repo_id}'. Confirm you have accepted the gated dataset terms and that the token belongs to an authorized account." >&2
+    exit 1
+fi
 
 if [ -d "\${cluster_g1_npz_dir}" ]; then
     cluster_g1_npz_count=\$(find "\${cluster_g1_npz_dir}" -type f -name '*.npz' | wc -l | tr -d '[:space:]')
@@ -155,8 +179,12 @@ CLUSTER_SIF_PATH="$HOME/$CLUSTER_SIF_PATH"
 CLUSTER_DATA_DIR="$HOME/$CLUSTER_DATA_DIR"
 CLUSTER_HF_TOKEN_FILE="$HOME/$CLUSTER_HF_TOKEN_FILE"
 CLUSTER_WANDB_API_KEY_FILE="$HOME/$CLUSTER_WANDB_API_KEY_FILE"
-[ -n "${CLUSTER_G1_MANIFEST_PATH:-}" ] && CLUSTER_G1_MANIFEST_PATH="$HOME/$CLUSTER_G1_MANIFEST_PATH"
-[ -n "${CLUSTER_G1_DATA_ROOT:-}" ] && CLUSTER_G1_DATA_ROOT="$HOME/$CLUSTER_G1_DATA_ROOT"
+if [ -n "${CLUSTER_G1_MANIFEST_PATH:-}" ] && [[ "${CLUSTER_G1_MANIFEST_PATH}" != /* ]] && [[ "${CLUSTER_G1_MANIFEST_PATH}" != ./* ]]; then
+    CLUSTER_G1_MANIFEST_PATH="$HOME/$CLUSTER_G1_MANIFEST_PATH"
+fi
+if [ -n "${CLUSTER_G1_DATA_ROOT:-}" ] && [[ "${CLUSTER_G1_DATA_ROOT}" != /* ]] && [[ "${CLUSTER_G1_DATA_ROOT}" != ./* ]]; then
+    CLUSTER_G1_DATA_ROOT="$HOME/$CLUSTER_G1_DATA_ROOT"
+fi
 
 # Runtime home inside singularity container.
 # Defaults to /home/$USER so Isaac Sim writes to a user path, but the path is
