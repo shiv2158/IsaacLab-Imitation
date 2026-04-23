@@ -602,6 +602,7 @@ class ImitationG1LafanTrackEnvCfg(ImitationG1BaseTrackingEnvCfg):
     }
     reset_schedule: str = "random"
     refresh_zarr_dataset: bool = False
+    lafan1_refresh_zarr_dataset: bool = False
     require_npz_body_states: bool = True
     lafan1_manifest_path: str | None = None
     motions: list[str] | None = None
@@ -626,6 +627,11 @@ class ImitationG1LafanTrackEnvCfg(ImitationG1BaseTrackingEnvCfg):
         if "dataset_path" in remaining:
             value = remaining.pop("dataset_path")
             self.dataset_path = None if value is None else str(value)
+
+        if "lafan1_refresh_zarr_dataset" in remaining:
+            value = remaining.pop("lafan1_refresh_zarr_dataset")
+            self.lafan1_refresh_zarr_dataset = bool(value)
+            self.refresh_zarr_dataset = bool(value)
 
         if "motions" in remaining:
             value = remaining.pop("motions")

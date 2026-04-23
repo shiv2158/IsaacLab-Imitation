@@ -15,15 +15,15 @@ CLUSTER_ISAAC_SIM_CACHE_DIR=scratch/Research/IsaacLab/docker-isaac-sim
 # e.g. scratch/isaaclab
 CLUSTER_ISAACLAB_DIR=scratch/Research/IsaacLab/isaaclab
 # Cluster login
-CLUSTER_LOGIN=ice
+CLUSTER_LOGIN=dheddesheimer3@login-ice.pace.gatech.edu
 # Cluster scratch directory to store the SIF file
 # e.g. scratch
 CLUSTER_SIF_PATH=scratch/Research/IsaacLab/isaaclabsif
 # Host directory for datasets (must be on a filesystem with sufficient space)
 # This is bind-mounted into the container at /data
 CLUSTER_DATA_DIR=scratch/Research/IsaacLab/data
-# Auto-check and bootstrap the full G1 LAFAN1 dataset before each submitted job.
-CLUSTER_AUTO_SETUP_G1_DATA=1
+# Use hardcoded local Unitree manifest for smoke-testing FastSAC/IPMD.
+CLUSTER_AUTO_SETUP_G1_DATA=0
 # Expected number of G1 motions in the full manifest.
 #CLUSTER_G1_EXPECTED_MOTION_COUNT=40
 # Override the full G1 dataset root used by the cluster preflight helper.
@@ -46,7 +46,7 @@ CLUSTER_WANDB_API_KEY_FILE=.wandb_api_key
 #CLUSTER_APPEND_DEFAULT_G1_MANIFEST=1
 # Override the default full G1 manifest path appended to submitted jobs.
 # Defaults to ${CLUSTER_G1_DATA_ROOT}/manifests/g1_lafan1_manifest.json.
-# CLUSTER_G1_MANIFEST_PATH=${CLUSTER_DATA_DIR}/unitree/manifests/g1_unitree_dance102_manifest.json
+CLUSTER_G1_MANIFEST_PATH=./data/unitree/manifests/g1_unitree_dance102_manifest.json
 # Control whether cluster preflight rewrites CLUSTER_G1_MANIFEST_PATH.
 # auto: regenerate only if missing or stale relative to ${CLUSTER_G1_DATA_ROOT}/npz/g1
 # never: do not touch the manifest; useful for hand-authored or Unitree manifests

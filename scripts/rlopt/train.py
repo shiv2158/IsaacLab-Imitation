@@ -192,6 +192,7 @@ import gymnasium as gym
 import isaaclab_imitation.tasks  # noqa: F401
 import isaaclab_tasks  # noqa: F401
 import numpy as np
+import rlopt
 import wandb
 from isaaclab.envs import (
     DirectMARLEnv,
@@ -494,6 +495,8 @@ def main(
     agent_cfg: RLOptConfig,
 ):
     """Train with stable-baselines agent."""
+    logger.info("Using rlopt package from: %s", Path(rlopt.__file__).resolve().parent)
+
     sync_input_keys = getattr(agent_cfg, "sync_input_keys", None)
     if callable(sync_input_keys):
         sync_input_keys()
@@ -520,7 +523,6 @@ def main(
         agent_cfg.collector.total_frames = (
             args_cli.max_iterations * agent_cfg.collector.frames_per_batch
         )
-    agent_cfg.collector.frames_per_batch *= env_cfg.scene.num_envs
     # Convert warmup_collects → init_random_frames now that frames_per_batch is finalized.
     # warmup_collects is set in task configs; the base CollectorConfig default (1000) is
     # far too small for vectorized envs (1 batch = num_envs * fpb >> 1000).
@@ -533,6 +535,17 @@ def main(
     # frames_per_batch. Align to an exact number of rollout batches.
     frames_per_batch = int(agent_cfg.collector.frames_per_batch)
     total_frames = int(agent_cfg.collector.total_frames)
+    log_interval = int(getattr(agent_cfg.trainer, "log_interval", max(1, total_frames)))
+    if total_frames > 0 and log_interval > 0:
+        approx_log_points = total_frames // log_interval
+        if approx_log_points > 5000:
+            logger.warning(
+                "Dense logging configuration detected: total_frames=%d, log_interval=%d (~%d points). "
+                "Consider --log_interval 8192 or 16384 for long runs to reduce W&B rate limiting.",
+                total_frames,
+                log_interval,
+                approx_log_points,
+            )
     if frames_per_batch > 0:
         aligned_total_frames = max(
             frames_per_batch,

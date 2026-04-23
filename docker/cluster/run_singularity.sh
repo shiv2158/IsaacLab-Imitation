@@ -47,14 +47,12 @@ build_g1_preflight_cmd() {
     local quoted_expected_motion_count=""
     local quoted_repo_id=""
     local quoted_manifest_refresh_policy=""
-    local quoted_hf_token_check_repo_id=""
 
     printf -v quoted_data_root '%q' "$data_root"
     printf -v quoted_manifest_path '%q' "$manifest_path"
     printf -v quoted_expected_motion_count '%q' "$expected_motion_count"
     printf -v quoted_repo_id '%q' "$repo_id"
     printf -v quoted_manifest_refresh_policy '%q' "$manifest_refresh_policy"
-    printf -v quoted_hf_token_check_repo_id '%q' "$repo_id"
 
     cat <<EOF
 cluster_g1_data_root=${quoted_data_root}
@@ -76,7 +74,7 @@ if ! /isaac-sim/python.sh - <<PY
 from huggingface_hub import HfApi
 import os
 
-repo_id = ${quoted_hf_token_check_repo_id}
+repo_id = "\${cluster_g1_repo_id}"
 token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_HUB_TOKEN")
 
 HfApi().repo_info(repo_id=repo_id, repo_type="dataset", token=token)

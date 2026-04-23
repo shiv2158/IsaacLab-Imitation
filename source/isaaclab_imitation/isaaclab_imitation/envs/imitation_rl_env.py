@@ -1541,6 +1541,17 @@ class ImitationRLEnv(ManagerBasedRLEnv):
             self._index_copy_reference_rows_(self.current_expert_frame, reference, env_ids)
         self._invalidate_mdp_cache()
 
+    @staticmethod
+    def _trajectory_state_device(tm: Any) -> torch.device:
+        """Resolve the internal trajectory-manager state device across API versions."""
+        if hasattr(tm, "_state_device"):
+            return torch.device(getattr(tm, "_state_device"))
+        if hasattr(tm, "_device") and getattr(tm, "_device") is not None:
+            return torch.device(getattr(tm, "_device"))
+        if hasattr(tm, "env_step") and isinstance(tm.env_step, torch.Tensor):
+            return tm.env_step.device
+        return torch.device("cpu")
+
     def _reset_idx(self, env_ids: torch.Tensor):
         """Reset the specified environments.
 
@@ -1554,11 +1565,12 @@ class ImitationRLEnv(ManagerBasedRLEnv):
         # Reset trajectory tracking (reassigns trajectories and resets steps).
         reset_steps = None
         if self._random_reset_step_max > self._random_reset_step_min:
+            tm_device = self._trajectory_state_device(self.trajectory_manager)
             reset_steps = torch.randint(
                 low=self._random_reset_step_min,
                 high=self._random_reset_step_max + 1,
                 size=(int(env_ids.shape[0]),),
-                device=self.trajectory_manager._state_device,
+                device=tm_device,
                 dtype=torch.long,
             )
         self.trajectory_manager.reset_envs(env_ids.clone(), steps=reset_steps)
@@ -1785,9 +1797,39 @@ class ImitationRLEnv(ManagerBasedRLEnv):
         if batch_size <= 0:
             raise ValueError("batch_size must be > 0.")
 
-        expert_frame, env_ids_tm, global_indices = (
-            self.trajectory_manager.sample_random_transitions(batch_size)
-        )
+        tm = self.trajectory_manager
+        if hasattr(tm, "sample_random_transitions"):
+            expert_frame, env_ids_tm, global_indices = tm.sample_random_transitions(
+                batch_size
+            )
+        else:
+            # Backward/forward compatibility: synthesize random transitions from
+            # trajectory manager state when sample_random_transitions() is unavailable.
+            tm_device = self._trajectory_state_device(tm)
+            env_ids_tm = torch.randint(
+                low=0,
+                high=int(tm.num_envs),
+                size=(batch_size,),
+                device=tm_device,
+                dtype=torch.long,
+            )
+            traj_ranks = tm.env_traj_rank[env_ids_tm]
+            traj_lengths = tm._length[traj_ranks].clamp(min=1)
+            local_steps = torch.floor(
+                torch.rand((batch_size,), device=tm_device)
+                * traj_lengths.to(dtype=torch.float32)
+            ).to(dtype=torch.long)
+            global_indices = (tm._start[traj_ranks] + local_steps).clamp(
+                min=tm._start[traj_ranks], max=tm._end[traj_ranks] - 1
+            )
+            expert_frame = tm.rb[global_indices]
+            if getattr(tm, "_device", None) is not None:
+                expert_frame = expert_frame.to(tm._device)
+            if hasattr(tm, "_attach_reference_fields"):
+                expert_frame = tm._attach_reference_fields(
+                    expert_frame, traj_ranks=traj_ranks, use_buffers=False
+                )
+
         return (
             expert_frame.to(self.device),
             env_ids_tm.to(self.device),
@@ -1801,17 +1843,19 @@ class ImitationRLEnv(ManagerBasedRLEnv):
     ) -> torch.Tensor:
         """Convert replay-buffer global indices back to local trajectory steps."""
         tm = self.trajectory_manager
-        env_ids_tm = env_ids.to(device=tm._state_device, dtype=torch.long)
-        global_indices_tm = global_indices.to(device=tm._state_device, dtype=torch.long)
+        tm_device = self._trajectory_state_device(tm)
+        env_ids_tm = env_ids.to(device=tm_device, dtype=torch.long)
+        global_indices_tm = global_indices.to(device=tm_device, dtype=torch.long)
         traj_ranks = tm.env_traj_rank[env_ids_tm]
         local_steps = global_indices_tm - tm._start[traj_ranks]
         return local_steps.to(device=self.device, dtype=torch.long)
 
     def _current_local_steps(self, env_ids: torch.Tensor) -> torch.Tensor:
         tm = self.trajectory_manager
-        return tm.env_step[
-            env_ids.to(device=tm._state_device, dtype=torch.long)
-        ].to(device=self.device, dtype=torch.long)
+        tm_device = self._trajectory_state_device(tm)
+        return tm.env_step[env_ids.to(device=tm_device, dtype=torch.long)].to(
+            device=self.device, dtype=torch.long
+        )
 
     def _sample_expert_window_slice(
         self,
@@ -1825,12 +1869,13 @@ class ImitationRLEnv(ManagerBasedRLEnv):
         if past_steps < 0 or future_steps < 0:
             raise ValueError("Expert window steps must be >= 0.")
         tm = self.trajectory_manager
-        env_ids_tm = env_ids.to(device=tm._state_device, dtype=torch.long)
-        local_steps_tm = local_steps.to(device=tm._state_device, dtype=torch.long)
+        tm_device = self._trajectory_state_device(tm)
+        env_ids_tm = env_ids.to(device=tm_device, dtype=torch.long)
+        local_steps_tm = local_steps.to(device=tm_device, dtype=torch.long)
         window_offsets = torch.arange(
             -past_steps,
             future_steps + 1,
-            device=tm._state_device,
+            device=tm_device,
             dtype=torch.long,
         )
         window_steps = local_steps_tm.unsqueeze(1) + window_offsets.unsqueeze(0)
